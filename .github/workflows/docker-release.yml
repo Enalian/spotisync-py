@@ -4,6 +4,12 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Тег версии для сборки (например, v7.3.14)"
+        required: true
+        default: "v7.3.14"
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -37,8 +43,8 @@ jobs:
           flavor: |
             latest=true
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{version}},value=${{ inputs.version || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version || github.ref_name }}
             type=raw,value=latest
 
       - name: Build and push Docker image
