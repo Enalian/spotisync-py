@@ -2,6 +2,7 @@ FROM python:3.14-slim
 
 ARG PUID=1000
 ARG PGID=1000
+LABEL org.opencontainers.image.source="https://github.com/Enalian/spotisync-py"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
