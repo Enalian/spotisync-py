@@ -1,0 +1,62 @@
+services:
+  netbird:
+    image: netbirdio/netbird:latest
+    container_name: azuracast_netbird
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    environment:
+      - NB_MANAGEMENT_URL=http://netbird
+      - NB_DISABLE_DNS=true
+    volumes:
+      - netbird_data:/var/lib/netbird
+
+  spotisync:
+    build:
+      context: ./spotisync
+      dockerfile: Dockerfile
+      args:
+        PUID: 1000
+        PGID: 1000
+    container_name: azuracast_spotisync
+    user: "1000:1000"
+    restart: unless-stopped
+    env_file:
+      - ./spotisync.env
+    depends_on:
+      - spotisync_pot
+      - netbird
+    network_mode: "service:netbird"
+    volumes:
+      - station_data:/var/azuracast/stations
+      - spotisync_data:/app/data
+    tmpfs:
+      - /tmp/spotisync_staging:size=512M,uid=1000,gid=1000,mode=1777
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  spotisync_pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: azuracast_spotisync_pot
+    restart: unless-stopped
+    depends_on:
+      - netbird
+    network_mode: "service:netbird"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "1"
+
+volumes:
+  spotisync_data:
+  netbird_data:
