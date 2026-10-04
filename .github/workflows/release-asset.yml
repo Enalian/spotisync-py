@@ -1,0 +1,28 @@
+name: Upload sync_spotify.py to Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Тег существующего релиза (например, v7.3.17)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  upload-asset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Upload sync_spotify.py to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          gh release upload "$RELEASE_TAG" ./spotisync/sync_spotify.py --clobber
