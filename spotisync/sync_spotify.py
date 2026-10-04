@@ -32,8 +32,8 @@ import yt_dlp
 load_dotenv()
 
 BUILD_VERSION = (
-    "v7.3.16-MODERN (Python 3.12+ | AzuraCast AutoDJ Queue Clear on Sync/Delete | "
-    "Auto-Delete Ignored Tracks | Strict Spotify-ID Ignores Priority)"
+    "v7.3.17-MODERN (Python 3.12+ | AzuraCast Media Indexer Polling & Cache Flush | "
+    "AutoDJ Queue Clear | Auto-Delete Ignored Tracks)"
 )
 
 TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
@@ -3776,7 +3776,7 @@ async def unassign_tracks_from_azuracast_playlist(filenames_to_remove: list[str]
 
 
 async def sync_with_azuracast(expected_filenames: list[str], new_downloads_count: int) -> None:
-    if not is_azuracast_configured() or is_shutting_down():
+    if not expected_filenames or not is_azuracast_configured() or is_shutting_down():
         return
     token_ctx = current_ctx.set("AZURACAST")
     try:
@@ -3791,15 +3791,72 @@ async def sync_with_azuracast(expected_filenames: list[str], new_downloads_count
             logger.info(
                 f"Синхронизация со станцией AzuraCast #{station_id}, плейлист '{target_pl_name}' (ID: {target_pl_id})..."
             )
-            if new_downloads_count > 0:
-                await asyncio.sleep(3.0)
-
-            r_files = await client.get(f"{AZURACAST_URL}/api/station/{station_id}/files", headers=headers)
-            if r_files.status_code != 200 or not isinstance(station_files := r_files.json(), list):
-                logger.warning(f"Ошибка получения списка файлов AzuraCast: HTTP {r_files.status_code} ({r_files.text[:200]})")
-                return
 
             expected_set = set(expected_filenames)
+            max_poll_attempts = 12 if new_downloads_count > 0 else 3
+            station_files: list[dict[str, Any]] = []
+
+            for poll_idx in range(1, max_poll_attempts + 1):
+                if is_shutting_down():
+                    return
+                if poll_idx == 1 and new_downloads_count > 0:
+                    try:
+                        await client.get(
+                            f"{AZURACAST_URL}/api/station/{station_id}/files/list",
+                            headers=headers,
+                            params={"internal": "true", "flushCache": "true"},
+                        )
+                        await client.put(
+                            f"{AZURACAST_URL}/api/station/{station_id}/files/batch",
+                            headers=headers,
+                            json={
+                                "do": "reprocess",
+                                "files": [],
+                                "directories": [AZURACAST_MEDIA_SUBDIR] if AZURACAST_MEDIA_SUBDIR else [""],
+                            },
+                        )
+                    except Exception:
+                        pass
+                    await sleep_interruptible(3.0)
+
+                r_files = await client.get(f"{AZURACAST_URL}/api/station/{station_id}/files", headers=headers)
+                if r_files.status_code != 200 or not isinstance(f_list := r_files.json(), list):
+                    logger.warning(f"Ошибка получения списка файлов AzuraCast: HTTP {r_files.status_code} ({r_files.text[:200]})")
+                    return
+                station_files = f_list
+
+                indexed_names: set[str] = set()
+                for f_obj in station_files:
+                    rel_path = str(f_obj.get("path") or "")
+                    if AZURACAST_MEDIA_SUBDIR and not rel_path.startswith(f"{AZURACAST_MEDIA_SUBDIR}/"):
+                        continue
+                    fname = Path(rel_path).name
+                    if fname in expected_set:
+                        indexed_names.add(fname)
+
+                missing_in_azura = expected_set - indexed_names
+                if not missing_in_azura or poll_idx == max_poll_attempts:
+                    if missing_in_azura:
+                        logger.warning(
+                            f"[AZURACAST] {len(missing_in_azura)} файлов с диска еще не проиндексированы в БД AzuraCast "
+                            f"(например: {', '.join(sorted(missing_in_azura)[:3])}). Они будут добавлены в следующем цикле."
+                        )
+                    break
+
+                logger.info(
+                    f"[AZURACAST WAIT {poll_idx}/{max_poll_attempts}] Ожидание индексации новых файлов в БД AzuraCast "
+                    f"(осталось проиндексировать: {len(missing_in_azura)} шт.)... Пауза 10сек"
+                )
+                try:
+                    await client.get(
+                        f"{AZURACAST_URL}/api/station/{station_id}/files/list",
+                        headers=headers,
+                        params={"internal": "true", "flushCache": "true"},
+                    )
+                except Exception:
+                    pass
+                await sleep_interruptible(10.0)
+
             playlist_groups: dict[tuple[int, ...], list[str]] = {}
             already_assigned = 0
 
@@ -3820,7 +3877,10 @@ async def sync_with_azuracast(expected_filenames: list[str], new_downloads_count
                     playlist_groups.setdefault(tuple(sorted(current_pl_ids | {target_pl_id})), []).append(rel_path)
 
             if not playlist_groups:
-                logger.success(f"Все проиндексированные треки ({already_assigned} шт.) уже состоят в плейлисте AzuraCast #{target_pl_id}!")
+                logger.success(
+                    f"Все проиндексированные треки ({already_assigned}/{len(expected_set)} шт.) "
+                    f"уже состоят в плейлисте AzuraCast #{target_pl_id}!"
+                )
                 return
 
             total_added = 0
