@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import contextvars
+from dataclasses import asdict, dataclass, field
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
+from pathlib import Path
 import re
 import shutil
 import signal
@@ -14,26 +20,20 @@ import sys
 import tempfile
 import threading
 import time
-from collections import OrderedDict, deque
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from typing import Any, Self
 
-import httpx
-import yt_dlp
 from dotenv import load_dotenv
+import httpx
 from mutagen.easyid3 import EasyID3
-from mutagen.id3 import APIC, ID3, TSRC, TXXX, ID3NoHeaderError
+from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TSRC, TXXX
 from mutagen.mp3 import MP3
+import yt_dlp
 
 load_dotenv()
 
 BUILD_VERSION = (
-    "v7.3.14-MODERN (Python 3.12+ | Strict Spotify-ID .spotitracks.json Ignores Priority | "
-    "Ceiling Time Format 1ч 2мин 35сек | Same-Source Skip)"
+    "v7.3.15-MODERN (Python 3.12+ | Auto-Delete Previously Downloaded Ignored Tracks | "
+    "Strict Spotify-ID .spotitracks.json Ignores Priority | Ceiling Time Format)"
 )
 
 TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
@@ -74,9 +74,7 @@ SUCCESS_LEVEL = 25
 logging.addLevelName(TRACE_LEVEL, "TRACE")
 logging.addLevelName(SUCCESS_LEVEL, "SUCCESS")
 
-current_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "current_ctx", default="MAIN"
-)
+current_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("current_ctx", default="MAIN")
 
 LOG_LEVEL_STR = os.environ.get("LOG_LEVEL", "INFO").upper().strip()
 LOG_COLORS = parse_env_bool("LOG_COLORS", "true")
@@ -291,47 +289,35 @@ TRACK_ALLOW_EXTERNAL: bool = parse_env_bool("TRACK_ALLOW_EXTERNAL", "false")
 SYNC_INTERVAL_MINUTES: float = float(os.environ.get("SYNC_INTERVAL_MINUTES", "30"))
 OUTPUT_DIR: Path = Path(os.environ.get("OUTPUT_DIR", "/music"))
 
-CACHE_FILENAME: str = (
-    os.environ.get("CACHE_FILENAME", ".spotisync.json").strip() or ".spotisync.json"
-)
+CACHE_FILENAME: str = os.environ.get("CACHE_FILENAME", ".spotisync.json").strip() or ".spotisync.json"
 CACHE_FILE_PATH: Path = OUTPUT_DIR / CACHE_FILENAME
 
-CUSTOM_TRACKS_FILENAME: str = (
-    os.environ.get("CUSTOM_TRACKS_FILENAME", ".spotitracks.json").strip()
-    or ".spotitracks.json"
-)
+CUSTOM_TRACKS_FILENAME: str = os.environ.get("CUSTOM_TRACKS_FILENAME", ".spotitracks.json").strip() or ".spotitracks.json"
 CUSTOM_TRACKS_PATH: Path = OUTPUT_DIR / CUSTOM_TRACKS_FILENAME
 
 STAGING_DIR: Path = Path(os.environ.get("STAGING_DIR", "/tmp/spotisync_staging"))
 SYNC_DELETE_REMOVED: bool = parse_env_bool("SYNC_DELETE_REMOVED", "false")
+SYNC_DELETE_IGNORED: bool = (
+    parse_env_bool("SYNC_DELETE_IGNORED", "true" if SYNC_DELETE_REMOVED else "false")
+    if "SYNC_DELETE_IGNORED" in os.environ
+    else parse_env_bool("DELETE_IGNORED_TRACKS", "true" if SYNC_DELETE_REMOVED else "false")
+)
 PUID: int = int(os.environ.get("PUID", "1000"))
 PGID: int = int(os.environ.get("PGID", "1000"))
 
 CONCURRENT_DOWNLOADS: int = max(1, int(os.environ.get("CONCURRENT_DOWNLOADS", "5")))
 YTDLP_RETRIES: int = max(1, int(os.environ.get("YTDLP_RETRIES", "3")))
-YTDLP_SOCKET_TIMEOUT_SEC: int = max(
-    5, int(os.environ.get("YTDLP_SOCKET_TIMEOUT_SEC", "30"))
-)
+YTDLP_SOCKET_TIMEOUT_SEC: int = max(5, int(os.environ.get("YTDLP_SOCKET_TIMEOUT_SEC", "30")))
 
 WORKER_BASE_TIMEOUT_SEC: int = max(30, int(os.environ.get("WORKER_TIMEOUT_SEC", "360")))
-WORKER_SEARCH_TIMEOUT_SEC: float = max(
-    15.0, float(os.environ.get("WORKER_SEARCH_STEP_TIMEOUT_SEC", "180"))
-)
-WORKER_STALL_TIMEOUT_SEC: int = max(
-    15, int(os.environ.get("WORKER_STALL_TIMEOUT_SEC", "120"))
-)
-WORKER_STAGE_MAX_TIMEOUT_SEC: int = max(
-    60, int(os.environ.get("WORKER_MAX_HARD_TIMEOUT_SEC", "1500"))
-)
-MIN_ACCEPTABLE_SPEED_KBPS: float = max(
-    1.0, float(os.environ.get("MIN_ACCEPTABLE_SPEED_KBPS", "10"))
-)
+WORKER_SEARCH_TIMEOUT_SEC: float = max(15.0, float(os.environ.get("WORKER_SEARCH_STEP_TIMEOUT_SEC", "180")))
+WORKER_STALL_TIMEOUT_SEC: int = max(15, int(os.environ.get("WORKER_STALL_TIMEOUT_SEC", "120")))
+WORKER_STAGE_MAX_TIMEOUT_SEC: int = max(60, int(os.environ.get("WORKER_MAX_HARD_TIMEOUT_SEC", "1500")))
+MIN_ACCEPTABLE_SPEED_KBPS: float = max(1.0, float(os.environ.get("MIN_ACCEPTABLE_SPEED_KBPS", "10")))
 MIN_ACCEPTABLE_SPEED_BPS: float = MIN_ACCEPTABLE_SPEED_KBPS * 1024.0
 
 FAIL_TTL_HOURS: float = max(0.0, float(os.environ.get("FAIL_TTL_HOURS", "72")))
-FAILED_CACHE_FILE: Path = Path(
-    os.environ.get("FAILED_CACHE_FILE", "/app/data/failed_tracks.json")
-)
+FAILED_CACHE_FILE: Path = Path(os.environ.get("FAILED_CACHE_FILE", "/app/data/failed_tracks.json"))
 YT_COOKIE_FILE: Path = Path(os.environ.get("YT_COOKIE_FILE", "/app/data/cookies.txt"))
 POT_PROVIDER_URL: str = os.environ.get("POT_PROVIDER_URL", "").strip()
 
@@ -345,9 +331,7 @@ AZURACAST_API_KEY: str = os.environ.get("AZURACAST_API_KEY", "").strip()
 AZURACAST_STATION_ID: str = os.environ.get("AZURACAST_STATION_ID", "").strip()
 AZURACAST_PLAYLIST_ID: str = os.environ.get("AZURACAST_PLAYLIST_ID", "").strip()
 AZURACAST_PLAYLIST_NAME: str = os.environ.get("AZURACAST_PLAYLIST_NAME", "").strip()
-AZURACAST_MEDIA_SUBDIR: str = (
-    os.environ.get("AZURACAST_MEDIA_SUBDIR", "").strip().strip("/")
-)
+AZURACAST_MEDIA_SUBDIR: str = os.environ.get("AZURACAST_MEDIA_SUBDIR", "").strip().strip("/")
 
 DEFAULT_PLAYLIST_COVER_URL: str | None = None
 
@@ -368,12 +352,7 @@ def fetch_cover_cached(url: str) -> tuple[bytes, str] | None:
         if is_shutting_down():
             return None
         try:
-            r_cov = httpx.get(
-                url,
-                headers={"User-Agent": BROWSER_UA},
-                timeout=15.0,
-                follow_redirects=True,
-            )
+            r_cov = httpx.get(url, headers={"User-Agent": BROWSER_UA}, timeout=15.0, follow_redirects=True)
             if r_cov.status_code == 200 and r_cov.content:
                 mime = r_cov.headers.get("Content-Type", "image/jpeg")
                 res = (r_cov.content, mime)
@@ -409,39 +388,16 @@ def is_azuracast_configured() -> bool:
     for val in (AZURACAST_URL, AZURACAST_API_KEY, AZURACAST_STATION_ID):
         if any(p in val.lower() for p in placeholders):
             return False
-    if not (
-        AZURACAST_API_KEY.isascii()
-        and AZURACAST_URL.isascii()
-        and AZURACAST_STATION_ID.isascii()
-    ):
+    if not (AZURACAST_API_KEY.isascii() and AZURACAST_URL.isascii() and AZURACAST_STATION_ID.isascii()):
         return False
     return " " not in AZURACAST_API_KEY and len(AZURACAST_API_KEY) >= 8
 
 
-STOP_WORDS: frozenset[str] = frozenset(
-    {
-        "remix",
-        "cover",
-        "live",
-        "nightcore",
-        "slowed",
-        "reverb",
-        "sped up",
-        "speed up",
-        "instrumental",
-        "karaoke",
-        "tiktok",
-        "edit",
-        "snippet",
-        "teaser",
-        "bass boosted",
-        "remake",
-        "tribute",
-        "8d",
-        "mashup",
-        "acoustic",
-    }
-)
+STOP_WORDS: frozenset[str] = frozenset({
+    "remix", "cover", "live", "nightcore", "slowed", "reverb", "sped up", "speed up",
+    "instrumental", "karaoke", "tiktok", "edit", "snippet", "teaser", "bass boosted",
+    "remake", "tribute", "8d", "mashup", "acoustic",
+})
 
 VERSION_EQUIVALENCE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("remix", ("remix", "rmx", "flip", "bootleg", "vip", "mix")),
@@ -455,29 +411,9 @@ VERSION_EQUIVALENCE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 BRACKET_KEEP_KEYWORDS: tuple[str, ...] = (
-    "remix",
-    "rmx",
-    "slow",
-    "sped",
-    "speed",
-    "nightcore",
-    "instrumental",
-    "extended",
-    "vip",
-    "mix",
-    "edit",
-    "version",
-    "ver",
-    "japanese",
-    "russian",
-    "acoustic",
-    "live",
-    "cover",
-    "ost",
-    "soundtrack",
-    "theme",
-    "vision",
-    "flip",
+    "remix", "rmx", "slow", "sped", "speed", "nightcore", "instrumental",
+    "extended", "vip", "mix", "edit", "version", "ver", "japanese", "russian",
+    "acoustic", "live", "cover", "ost", "soundtrack", "theme", "vision", "flip",
 )
 
 YT_CLIENT_PROFILES: tuple[dict[str, Any], ...] = (
@@ -491,43 +427,12 @@ BROWSER_UA = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 )
 
-CYR_TO_LAT_TABLE = str.maketrans(
-    {
-        "а": "a",
-        "б": "b",
-        "в": "v",
-        "г": "g",
-        "д": "d",
-        "е": "e",
-        "ё": "yo",
-        "ж": "zh",
-        "з": "z",
-        "и": "i",
-        "й": "y",
-        "к": "k",
-        "л": "l",
-        "м": "m",
-        "н": "n",
-        "о": "o",
-        "п": "p",
-        "р": "r",
-        "с": "s",
-        "т": "t",
-        "у": "u",
-        "ф": "f",
-        "х": "kh",
-        "ц": "ts",
-        "ч": "ch",
-        "ш": "sh",
-        "щ": "shch",
-        "ъ": "",
-        "ы": "y",
-        "ь": "",
-        "э": "e",
-        "ю": "yu",
-        "я": "ya",
-    }
-)
+CYR_TO_LAT_TABLE = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh",
+    "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o",
+    "п": "p", "р": "r", "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts",
+    "ч": "ch", "ш": "sh", "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+})
 
 file_move_lock = threading.Lock()
 cache_lock = threading.Lock()
@@ -595,9 +500,7 @@ def contains_word_token(text: str, phrase: str) -> bool:
     p_clean = phrase.strip().lower()
     if not p_clean:
         return False
-    pattern = (
-        r"(?<![a-zA-Z0-9а-яА-ЯёЁ])" + re.escape(p_clean) + r"(?![a-zA-Z0-9а-яА-ЯёЁ])"
-    )
+    pattern = r"(?<![a-zA-Z0-9а-яА-ЯёЁ])" + re.escape(p_clean) + r"(?![a-zA-Z0-9а-яА-ЯёЁ])"
     return bool(re.search(pattern, text.lower()))
 
 
@@ -663,9 +566,7 @@ class AdaptiveWorkerWatchdog:
     aborted_by_watchdog: bool = False
     hard_cancelled: bool = False
     abort_reason: str = ""
-    _lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
-    )
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         now = time.monotonic()
@@ -681,28 +582,16 @@ class AdaptiveWorkerWatchdog:
             return True, self.abort_reason or "Прервано по сигналу Watchdog"
         stage_elapsed = now - self.stage_start_time
         if stage_elapsed > WORKER_STAGE_MAX_TIMEOUT_SEC:
-            return (
-                True,
-                f"Превышен лимит этапа '{self.stage}' ({format_duration(WORKER_STAGE_MAX_TIMEOUT_SEC)})",
-            )
-        if (
-            self.stage.startswith("download")
-            and (now - self.last_activity) > WORKER_STALL_TIMEOUT_SEC
-        ):
+            return True, f"Превышен лимит этапа '{self.stage}' ({format_duration(WORKER_STAGE_MAX_TIMEOUT_SEC)})"
+        if self.stage.startswith("download") and (now - self.last_activity) > WORKER_STALL_TIMEOUT_SEC:
             return True, (
                 f"Зависание скачивания на этапе '{self.stage}' ({format_duration(now - self.last_activity)} без данных, "
                 f"скорость: {format_speed(self.ema_speed_bps)})"
             )
         if now > self.deadline:
             if self.stage.startswith("search"):
-                return (
-                    True,
-                    f"Таймаут поискового запроса '{self.stage}' ({format_duration(stage_elapsed)})",
-                )
-            return (
-                True,
-                f"Таймаут этапа '{self.stage}' ({format_duration(stage_elapsed)}, скорость: {format_speed(self.ema_speed_bps)})",
-            )
+                return True, f"Таймаут поискового запроса '{self.stage}' ({format_duration(stage_elapsed)})"
+            return True, f"Таймаут этапа '{self.stage}' ({format_duration(stage_elapsed)}, скорость: {format_speed(self.ema_speed_bps)})"
         return False, ""
 
     def check_expired(self) -> tuple[bool, str]:
@@ -719,14 +608,10 @@ class AdaptiveWorkerWatchdog:
         end_t = time.monotonic() + seconds
         while (now := time.monotonic()) < end_t:
             if is_shutting_down():
-                raise TimeoutError(
-                    f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})"
-                )
+                raise TimeoutError(f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})")
             with self._lock:
                 if self.hard_cancelled:
-                    raise TimeoutError(
-                        self.abort_reason or "Прервано по сигналу Watchdog"
-                    )
+                    raise TimeoutError(self.abort_reason or "Прервано по сигналу Watchdog")
             time.sleep(min(0.2, max(0.01, end_t - now)))
         with self._lock:
             now = time.monotonic()
@@ -735,14 +620,10 @@ class AdaptiveWorkerWatchdog:
 
     def reset_for_search_stage(self, stage_label: str = "search") -> None:
         if is_shutting_down():
-            raise TimeoutError(
-                f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})"
-            )
+            raise TimeoutError(f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})")
         with self._lock:
             if self.hard_cancelled:
-                raise TimeoutError(
-                    self.abort_reason or "Остановлено адаптивным таймером"
-                )
+                raise TimeoutError(self.abort_reason or "Остановлено адаптивным таймером")
             now = time.monotonic()
             self.aborted_by_watchdog = False
             self.stage = stage_label
@@ -752,23 +633,15 @@ class AdaptiveWorkerWatchdog:
             self.total_bytes = 0
             self.ema_speed_bps = 0.0
             avg_s = speed_tracker.avg_speed_bps
-            allowance = (
-                max(WORKER_SEARCH_TIMEOUT_SEC, 240.0)
-                if (0 < avg_s < 60 * 1024)
-                else WORKER_SEARCH_TIMEOUT_SEC
-            )
+            allowance = max(WORKER_SEARCH_TIMEOUT_SEC, 240.0) if (0 < avg_s < 60 * 1024) else WORKER_SEARCH_TIMEOUT_SEC
             self.deadline = now + allowance
 
     def reset_for_download_attempt(self, attempt_label: str = "download") -> None:
         if is_shutting_down():
-            raise TimeoutError(
-                f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})"
-            )
+            raise TimeoutError(f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})")
         with self._lock:
             if self.hard_cancelled:
-                raise TimeoutError(
-                    self.abort_reason or "Остановлено адаптивным таймером"
-                )
+                raise TimeoutError(self.abort_reason or "Остановлено адаптивным таймером")
             now = time.monotonic()
             self.aborted_by_watchdog = False
             self.stage = attempt_label
@@ -781,15 +654,11 @@ class AdaptiveWorkerWatchdog:
 
     def update_download(self, downloaded: int, total: int, speed: float | None) -> None:
         if is_shutting_down():
-            raise yt_dlp.utils.DownloadError(
-                f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})"
-            )
+            raise yt_dlp.utils.DownloadError(f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})")
         with self._lock:
             now = time.monotonic()
             if self.hard_cancelled:
-                raise yt_dlp.utils.DownloadError(
-                    self.abort_reason or "Остановлено адаптивным таймером"
-                )
+                raise yt_dlp.utils.DownloadError(self.abort_reason or "Остановлено адаптивным таймером")
             if not self.stage.startswith("download"):
                 self.stage = "download"
                 self.stage_start_time = now
@@ -801,11 +670,7 @@ class AdaptiveWorkerWatchdog:
             if total > 0:
                 self.total_bytes = total
             if speed and speed > 0:
-                self.ema_speed_bps = (
-                    float(speed)
-                    if self.ema_speed_bps <= 0
-                    else (0.3 * float(speed) + 0.7 * self.ema_speed_bps)
-                )
+                self.ema_speed_bps = float(speed) if self.ema_speed_bps <= 0 else (0.3 * float(speed) + 0.7 * self.ema_speed_bps)
 
             stall_sec = now - self.last_activity
             if stall_sec > WORKER_STALL_TIMEOUT_SEC:
@@ -819,23 +684,16 @@ class AdaptiveWorkerWatchdog:
             eff_speed = max(self.ema_speed_bps, MIN_ACCEPTABLE_SPEED_BPS)
             if self.total_bytes > self.downloaded_bytes and eff_speed > 0:
                 eta_sec = (self.total_bytes - self.downloaded_bytes) / eff_speed
-                self.deadline = now + min(
-                    max(eta_sec * 3.0 + 120.0, 150.0),
-                    float(WORKER_STAGE_MAX_TIMEOUT_SEC),
-                )
+                self.deadline = now + min(max(eta_sec * 3.0 + 120.0, 150.0), float(WORKER_STAGE_MAX_TIMEOUT_SEC))
             else:
                 self.deadline = now + 150.0
 
     def enter_ffmpeg(self) -> None:
         if is_shutting_down():
-            raise yt_dlp.utils.DownloadError(
-                f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})"
-            )
+            raise yt_dlp.utils.DownloadError(f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})")
         with self._lock:
             if self.hard_cancelled:
-                raise yt_dlp.utils.DownloadError(
-                    self.abort_reason or "Остановлено адаптивным таймером"
-                )
+                raise yt_dlp.utils.DownloadError(self.abort_reason or "Остановлено адаптивным таймером")
             now = time.monotonic()
             self.aborted_by_watchdog = False
             self.stage = "ffmpeg"
@@ -845,9 +703,7 @@ class AdaptiveWorkerWatchdog:
 
     def enter_tagging(self) -> None:
         if is_shutting_down():
-            raise TimeoutError(
-                f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})"
-            )
+            raise TimeoutError(f"Остановка контейнера ({shutdown_signal_name or 'SIGTERM'})")
         with self._lock:
             now = time.monotonic()
             self.aborted_by_watchdog = False
@@ -938,11 +794,7 @@ class TrackMeta:
 
 
 def is_valid_spotify_track(meta: TrackMeta) -> bool:
-    if (
-        meta.spotify_id.startswith("custom_")
-        or meta.direct_url
-        or not FILTER_UNAVAILABLE_SPOTIFY
-    ):
+    if meta.spotify_id.startswith("custom_") or meta.direct_url or not FILTER_UNAVAILABLE_SPOTIFY:
         return True
     if len(meta.spotify_id) != 22:
         return False
@@ -955,9 +807,7 @@ def is_valid_spotify_track(meta: TrackMeta) -> bool:
 
 def parse_jsonc(text: str) -> Any:
     pattern = r'("(?:\\.|[^"\\])*")|/\*.*?\*/|//[^\r\n]*'
-    cleaned = re.sub(
-        pattern, lambda m: m.group(1) if m.group(1) else "", text, flags=re.DOTALL
-    )
+    cleaned = re.sub(pattern, lambda m: m.group(1) if m.group(1) else "", text, flags=re.DOTALL)
     cleaned = re.sub(r",\s*([\}\]])", r"\1", cleaned)
     return json.loads(cleaned)
 
@@ -983,9 +833,7 @@ def load_folder_cache() -> dict[str, Any]:
         if isinstance(raw, dict) and "tracks" in raw:
             return raw
     except Exception as e:
-        logger.warning(
-            f"Файл кэша {CACHE_FILE_PATH.name} поврежден ({e}), создаем новый."
-        )
+        logger.warning(f"Файл кэша {CACHE_FILE_PATH.name} поврежден ({e}), создаем новый.")
     return create_empty_cache()
 
 
@@ -994,9 +842,7 @@ def save_folder_cache_unlocked(cache_data: dict[str, Any]) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         cache_data["updated_at"] = int(time.time())
         tmp_path = OUTPUT_DIR / f"{CACHE_FILENAME}.tmp"
-        tmp_path.write_text(
-            json.dumps(cache_data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        tmp_path.write_text(json.dumps(cache_data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp_path.replace(CACHE_FILE_PATH)
         try:
             os.chown(CACHE_FILE_PATH, PUID, PGID)
@@ -1011,9 +857,7 @@ def save_folder_cache(cache_data: dict[str, Any]) -> None:
         save_folder_cache_unlocked(cache_data)
 
 
-def reconcile_cache_with_disk(
-    cache_data: dict[str, Any],
-) -> tuple[dict[str, Path], int]:
+def reconcile_cache_with_disk(cache_data: dict[str, Any]) -> tuple[dict[str, Path], int]:
     token_ctx = current_ctx.set("CACHE")
     try:
         tracks_cache: dict[str, Any] = cache_data.setdefault("tracks", {})
@@ -1076,12 +920,7 @@ def reconcile_cache_with_disk(
                             album = easy.get("album", ["Single"])[0]
                             audio_len = int(MP3(mp3_file).info.length)
                         except Exception:
-                            title, artist, album, audio_len = (
-                                stem,
-                                "Unknown",
-                                "Single",
-                                0,
-                            )
+                            title, artist, album, audio_len = stem, "Unknown", "Single", 0
 
                         tracks_cache[stem] = {
                             "meta": asdict(
@@ -1113,9 +952,7 @@ def reconcile_cache_with_disk(
         if recovered_count > 0:
             save_folder_cache(cache_data)
 
-        pending_in_cache = sum(
-            1 for e in tracks_cache.values() if not e.get("downloaded")
-        )
+        pending_in_cache = sum(1 for e in tracks_cache.values() if not e.get("downloaded"))
         is_full = cache_data.get("is_full_playlist", False)
         logger.info(
             f"Кэш {CACHE_FILE_PATH.name} проверен: в базе: {len(tracks_cache)} (полный: {yn(is_full)}) | "
@@ -1154,9 +991,7 @@ def parse_raw_ignore_entries(raw_ignore: Any) -> list[tuple[str, str]]:
                     parsed.append((sp_id, reason))
     elif isinstance(raw_ignore, dict):
         for k_raw, v_raw in raw_ignore.items():
-            if (
-                sp_id := extract_spotify_track_id(str(k_raw))
-            ) and sp_id not in seen_ids:
+            if (sp_id := extract_spotify_track_id(str(k_raw))) and sp_id not in seen_ids:
                 seen_ids.add(sp_id)
                 parsed.append((sp_id, str(v_raw or "").strip()))
     return parsed
@@ -1166,16 +1001,16 @@ def is_track_in_ignore_set(meta: TrackMeta, ignored_ids: set[str]) -> bool:
     return bool(ignored_ids and meta.spotify_id in ignored_ids)
 
 
-def load_custom_spotitracks() -> tuple[
-    dict[str, dict[str, Any]], list[TrackMeta], set[str], int
-]:
+def load_custom_spotitracks() -> tuple[dict[str, dict[str, Any]], list[TrackMeta], set[str], int]:
     token_ctx = current_ctx.set("SPOTITRACKS")
     try:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         if not CUSTOM_TRACKS_PATH.exists():
             template = {
                 "_comment": "Поддерживается JSONC (комментарии // и /* */). В ignores указываются Spotify ID или ссылки на треки Spotify (приоритет выше overrides).",
-                "ignores": ["https://open.spotify.com/track/EXAMPLE_IGNORED_ID"],
+                "ignores": [
+                    "https://open.spotify.com/track/EXAMPLE_IGNORED_ID"
+                ],
                 "overrides": {
                     "https://open.spotify.com/track/EXAMPLE_ID": "https://www.youtube.com/watch?v=EXAMPLE",
                     "Artist - Title": "https://soundcloud.com/EXAMPLE",
@@ -1194,9 +1029,7 @@ def load_custom_spotitracks() -> tuple[
                 ],
             }
             try:
-                CUSTOM_TRACKS_PATH.write_text(
-                    json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8"
-                )
+                CUSTOM_TRACKS_PATH.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
                 os.chown(CUSTOM_TRACKS_PATH, PUID, PGID)
             except OSError:
                 pass
@@ -1262,8 +1095,7 @@ def load_custom_spotitracks() -> tuple[
                 spotify_id=custom_id,
                 title=title,
                 artist=artist,
-                artists_all=[a.strip() for a in artist.split(",") if a.strip()]
-                or [artist],
+                artists_all=[a.strip() for a in artist.split(",") if a.strip()] or [artist],
                 album=album,
                 album_artist=artist.split(",")[0].strip(),
                 release_date=year,
@@ -1314,9 +1146,7 @@ def apply_overrides_to_tracks(
                 t.cover_url = str(ov["cover_url"]).strip()
             applied += 1
     if applied > 0:
-        logger.info(
-            f"[SPOTITRACKS] Применены прямые ссылки из {CUSTOM_TRACKS_PATH.name} для {applied} треков."
-        )
+        logger.info(f"[SPOTITRACKS] Применены прямые ссылки из {CUSTOM_TRACKS_PATH.name} для {applied} треков.")
     return tracks
 
 
@@ -1431,32 +1261,17 @@ def measure_directory_stats(directory: Path) -> tuple[int, int, int]:
     return total_bytes, mp3_count, free_bytes
 
 
-def calculate_smart_quarantine_ttl(
-    reason: str, attempts: int, avg_speed_bps: float
-) -> float:
+def calculate_smart_quarantine_ttl(reason: str, attempts: int, avg_speed_bps: float) -> float:
     if FAIL_TTL_HOURS <= 0:
         return 0.0
     r_low = reason.lower()
-    if any(
-        k in r_low
-        for k in (
-            "таймаут",
-            "timeout",
-            "зависание",
-            "поток замер",
-            "timed out",
-            "connection",
-            "network",
-        )
-    ):
+    if any(k in r_low for k in ("таймаут", "timeout", "зависание", "поток замер", "timed out", "connection", "network")):
         base_h = 1.0 if (0 < avg_speed_bps < 150 * 1024) else 2.0
         return min(base_h * max(1, attempts), 12.0)
     if any(k in r_low for k in ("format", "403", "sign in", "bot", "reloaded")):
         return min(6.0 * (1.5 ** max(0, attempts - 1)), FAIL_TTL_HOURS)
     base_not_found = min(24.0, FAIL_TTL_HOURS)
-    return min(
-        base_not_found * (2.0 ** max(0, attempts - 1)), max(FAIL_TTL_HOURS, 168.0)
-    )
+    return min(base_not_found * (2.0 ** max(0, attempts - 1)), max(FAIL_TTL_HOURS, 168.0))
 
 
 def load_quarantine() -> dict[str, dict[str, Any]]:
@@ -1471,8 +1286,7 @@ def load_quarantine() -> dict[str, dict[str, Any]]:
             k: v
             for k, v in data.items()
             if isinstance(v, dict)
-            and (now - float(v.get("time", now)))
-            < (float(v.get("ttl_hours", FAIL_TTL_HOURS)) * 3600)
+            and (now - float(v.get("time", now))) < (float(v.get("ttl_hours", FAIL_TTL_HOURS)) * 3600)
         }
     except Exception:
         return {}
@@ -1488,9 +1302,7 @@ def register_quarantine_failure(
     with quarantine_lock:
         prev = quarantine.get(spotify_id) or {}
         attempts = int(prev.get("attempts", 0)) + 1
-        ttl_hours = calculate_smart_quarantine_ttl(
-            reason, attempts, speed_tracker.avg_speed_bps
-        )
+        ttl_hours = calculate_smart_quarantine_ttl(reason, attempts, speed_tracker.avg_speed_bps)
         quarantine[spotify_id] = {
             "time": time.time(),
             "ttl_hours": round(ttl_hours, 2),
@@ -1501,9 +1313,7 @@ def register_quarantine_failure(
         return ttl_hours
 
 
-def clear_quarantine_entry(
-    quarantine: dict[str, dict[str, Any]] | None, spotify_id: str
-) -> None:
+def clear_quarantine_entry(quarantine: dict[str, dict[str, Any]] | None, spotify_id: str) -> None:
     if quarantine is None:
         return
     with quarantine_lock:
@@ -1518,9 +1328,7 @@ def save_quarantine_unlocked(quarantine: dict[str, dict[str, Any]]) -> None:
     try:
         FAILED_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp_q = FAILED_CACHE_FILE.with_suffix(".tmp")
-        tmp_q.write_text(
-            json.dumps(quarantine, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        tmp_q.write_text(json.dumps(quarantine, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp_q.replace(FAILED_CACHE_FILE)
     except OSError as e:
         logger.warning(f"Не удалось сохранить кэш карантина: {e}")
@@ -1534,14 +1342,7 @@ def inspect_cookie_file_health(cookie_path: Path) -> tuple[bool, str]:
     except OSError as e:
         return False, f"Ошибка чтения {cookie_path}: {e}"
 
-    auth_cookie_names = {
-        "SAPISID",
-        "__Secure-3PAPISID",
-        "__Secure-1PSID",
-        "__Secure-3PSID",
-        "SID",
-        "LOGIN_INFO",
-    }
+    auth_cookie_names = {"SAPISID", "__Secure-3PAPISID", "__Secure-1PSID", "__Secure-3PSID", "SID", "LOGIN_INFO"}
     found_auth: set[str] = set()
     expired_auth: set[str] = set()
     now_ts = int(time.time())
@@ -1566,54 +1367,31 @@ def inspect_cookie_file_health(cookie_path: Path) -> tuple[bool, str]:
                     found_auth.add(name)
 
     if total_cookies == 0:
-        return (
-            False,
-            "Файл куки пуст или имеет неверный формат (ожидается Netscape HTTP Cookie File)",
-        )
+        return False, "Файл куки пуст или имеет неверный формат (ожидается Netscape HTTP Cookie File)"
     if not found_auth:
         if expired_auth:
-            return (
-                False,
-                f"Срок действия авторизационных куки истек ({', '.join(sorted(expired_auth))})",
-            )
+            return False, f"Срок действия авторизационных куки истек ({', '.join(sorted(expired_auth))})"
         return False, (
             f"В файле найдено {total_cookies} куки, но отсутствуют ключи авторизации аккаунта "
             f"(SAPISID / __Secure-3PSID / LOGIN_INFO)."
         )
-    return (
-        True,
-        f"Найдено {total_cookies} куки (ключи сессии: {', '.join(sorted(found_auth))})",
-    )
+    return True, f"Найдено {total_cookies} куки (ключи сессии: {', '.join(sorted(found_auth))})"
 
 
 def convert_raw_cookie_header_to_netscape(raw_input: str) -> str:
     text = raw_input.strip()
-    if (
-        "# Netscape HTTP Cookie File" in text
-        or "\tTRUE\t/\t" in text
-        or "\tFALSE\t/\t" in text
-    ):
+    if "# Netscape HTTP Cookie File" in text or "\tTRUE\t/\t" in text or "\tFALSE\t/\t" in text:
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         if not lines[0].startswith("# Netscape HTTP Cookie File"):
             lines.insert(0, "# Netscape HTTP Cookie File")
         return "\n".join(lines) + "\n"
 
     text_unwrapped = re.sub(r"\\\s*\n\s*", " ", text)
-    curl_matches = re.findall(
-        r"(?:-H|--header)\s+\$?['\"]cookie:\s*([^'\"]+)['\"]",
-        text_unwrapped,
-        flags=re.I,
-    )
+    curl_matches = re.findall(r"(?:-H|--header)\s+\$?['\"]cookie:\s*([^'\"]+)['\"]", text_unwrapped, flags=re.I)
     if not curl_matches:
-        curl_matches = re.findall(
-            r"(?:-b|--cookie)\s+\$?['\"]([^'\"]+)['\"]", text_unwrapped, flags=re.I
-        )
+        curl_matches = re.findall(r"(?:-b|--cookie)\s+\$?['\"]([^'\"]+)['\"]", text_unwrapped, flags=re.I)
 
-    cookie_str = (
-        "; ".join(curl_matches)
-        if curl_matches
-        else re.sub(r"^cookie:\s*", "", text_unwrapped, flags=re.I).strip().strip("'\"")
-    )
+    cookie_str = "; ".join(curl_matches) if curl_matches else re.sub(r"^cookie:\s*", "", text_unwrapped, flags=re.I).strip().strip("'\"")
     cookie_dict: dict[str, str] = {}
     for chunk in cookie_str.split(";"):
         chunk = chunk.strip()
@@ -1626,28 +1404,14 @@ def convert_raw_cookie_header_to_netscape(raw_input: str) -> str:
     if not cookie_dict:
         raise ValueError("Не удалось найти пары key=value во введенных данных.")
 
-    auth_keys = [
-        k for k in cookie_dict if "PSID" in k or "SAPISID" in k or k == "LOGIN_INFO"
-    ]
-    print(
-        f"\n[ПАРСЕР] Распознано куки: {len(cookie_dict)} шт. | Аккаунт: {', '.join(auth_keys) or 'НЕТ'}"
-    )
+    auth_keys = [k for k in cookie_dict if "PSID" in k or "SAPISID" in k or k == "LOGIN_INFO"]
+    print(f"\n[ПАРСЕР] Распознано куки: {len(cookie_dict)} шт. | Аккаунт: {', '.join(auth_keys) or 'НЕТ'}")
 
     expiry = int(time.time()) + 365 * 24 * 3600
-    netscape_lines = [
-        "# Netscape HTTP Cookie File",
-        "# Generated automatically by SpotiSync --auth",
-        "",
-    ]
+    netscape_lines = ["# Netscape HTTP Cookie File", "# Generated automatically by SpotiSync --auth", ""]
     for name, val in cookie_dict.items():
-        secure = (
-            "TRUE"
-            if (name.startswith(("__Secure", "__Host")) or "SAPISID" in name)
-            else "FALSE"
-        )
-        netscape_lines.append(
-            f".youtube.com\tTRUE\t/\t{secure}\t{expiry}\t{name}\t{val}"
-        )
+        secure = "TRUE" if (name.startswith(("__Secure", "__Host")) or "SAPISID" in name) else "FALSE"
+        netscape_lines.append(f".youtube.com\tTRUE\t/\t{secure}\t{expiry}\t{name}\t{val}")
     return "\n".join(netscape_lines) + "\n"
 
 
@@ -1670,20 +1434,12 @@ def verify_youtube_cookies(cookie_path: Path) -> bool:
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
-                "https://www.youtube.com/feed/subscriptions", download=False
-            )
+            info = ydl.extract_info("https://www.youtube.com/feed/subscriptions", download=False)
             entries = info.get("entries") if isinstance(info, dict) else None
             if entries is not None:
-                print(
-                    f"[SUCCESS] Куки YouTube полностью рабочие! ({health_msg}). Сохранены в {cookie_path}"
-                )
+                print(f"[SUCCESS] Куки YouTube полностью рабочие! ({health_msg}). Сохранены в {cookie_path}")
                 return True
-            reason = (
-                adapter.last_error_msg
-                or adapter.last_warning_msg
-                or "YouTube не вернул ленту подписок"
-            )
+            reason = adapter.last_error_msg or adapter.last_warning_msg or "YouTube не вернул ленту подписок"
             print(f"[WARN] Авторизация YouTube не подтверждена! Причина: {reason}")
             return False
     except Exception as e:
@@ -1695,32 +1451,20 @@ def run_interactive_auth() -> None:
     print("\n" + "#" * 60)
     print(f" МАСТЕР НАСТРОЙКИ КУКИ YOUTUBE (--auth) | {BUILD_VERSION}")
     print("#" * 60)
-    print(
-        f" • Статус YouTube Cookie: {'Да (' + str(YT_COOKIE_FILE) + ')' if YT_COOKIE_FILE.exists() else 'Нет'}"
-    )
+    print(f" • Статус YouTube Cookie: {'Да (' + str(YT_COOKIE_FILE) + ')' if YT_COOKIE_FILE.exists() else 'Нет'}")
     print("-" * 60)
-    print(
-        "  [1] Вставить 'Copy as cURL' или строку 'Cookie:' из браузера (без расширений)"
-    )
+    print("  [1] Вставить 'Copy as cURL' или строку 'Cookie:' из браузера (без расширений)")
     print("  [2] Вставить содержимое готового файла cookies.txt (Netscape формат)")
     choice = input("\nВаш выбор [1/2, по умолчанию 1]: ").strip() or "1"
 
     YT_COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
     print("\n--- ИНСТРУКЦИЯ ---")
     if choice == "1":
-        print(
-            "1. Откройте окно Инкогнито в браузере и войдите на https://www.youtube.com"
-        )
-        print(
-            "2. Нажмите F12 (DevTools) -> вкладка 'Network' -> обновите страницу (F5)."
-        )
-        print(
-            "3. Правой кнопкой на первый запрос 'www.youtube.com' -> Copy -> Copy as cURL (bash)."
-        )
+        print("1. Откройте окно Инкогнито в браузере и войдите на https://www.youtube.com")
+        print("2. Нажмите F12 (DevTools) -> вкладка 'Network' -> обновите страницу (F5).")
+        print("3. Правой кнопкой на первый запрос 'www.youtube.com' -> Copy -> Copy as cURL (bash).")
         print("4. Сразу закройте окно Инкогнито (чтобы сессия не сбросилась).")
-        print(
-            "5. Вставьте скопированный текст ниже и нажмите Enter, затем пустую строку или END:\n"
-        )
+        print("5. Вставьте скопированный текст ниже и нажмите Enter, затем пустую строку или END:\n")
     else:
         print("Вставьте содержимое cookies.txt ниже и введите END на новой строке:\n")
 
@@ -1730,16 +1474,12 @@ def run_interactive_auth() -> None:
             line = input()
         except EOFError:
             break
-        if line.strip().upper() == "END" or (
-            choice == "1" and not line.strip() and collected_lines
-        ):
+        if line.strip().upper() == "END" or (choice == "1" and not line.strip() and collected_lines):
             break
         collected_lines.append(line)
 
     try:
-        netscape_content = convert_raw_cookie_header_to_netscape(
-            "\n".join(collected_lines)
-        )
+        netscape_content = convert_raw_cookie_header_to_netscape("\n".join(collected_lines))
         YT_COOKIE_FILE.write_text(netscape_content, encoding="utf-8")
         verify_youtube_cookies(YT_COOKIE_FILE)
     except Exception as e:
@@ -1752,28 +1492,16 @@ def parse_track_item(item: dict[str, Any]) -> TrackMeta | None:
     if not track or track.get("is_local") or not track.get("id"):
         return None
 
-    artists = [
-        a["name"].strip()
-        for a in track.get("artists", [])
-        if a.get("name") and a["name"].strip()
-    ]
+    artists = [a["name"].strip() for a in track.get("artists", []) if a.get("name") and a["name"].strip()]
     title = (track.get("name") or "").strip()
     dur_ms = int(track.get("duration_ms") or 0)
 
     if FILTER_UNAVAILABLE_SPOTIFY:
-        if (
-            track.get("is_playable") is False
-            or not artists
-            or artists[0].lower() == "unknown"
-            or not title
-            or dur_ms <= 0
-        ):
+        if track.get("is_playable") is False or not artists or artists[0].lower() == "unknown" or not title or dur_ms <= 0:
             return None
 
     album_obj = track.get("album") or {}
-    album_artists = [
-        a["name"].strip() for a in album_obj.get("artists", []) if a.get("name")
-    ]
+    album_artists = [a["name"].strip() for a in album_obj.get("artists", []) if a.get("name")]
     images = album_obj.get("images") or []
     track_num = track.get("track_number") or 1
     total_tracks = album_obj.get("total_tracks")
@@ -1784,9 +1512,7 @@ def parse_track_item(item: dict[str, Any]) -> TrackMeta | None:
         artist=artists[0] if artists else "Unknown",
         artists_all=artists or ["Unknown"],
         album=album_obj.get("name") or "Single",
-        album_artist=album_artists[0]
-        if album_artists
-        else (artists[0] if artists else "Unknown"),
+        album_artist=album_artists[0] if album_artists else (artists[0] if artists else "Unknown"),
         release_date=album_obj.get("release_date") or "",
         track_number=f"{track_num}/{total_tracks}" if total_tracks else str(track_num),
         disc_number=str(track.get("disc_number") or 1),
@@ -1796,9 +1522,7 @@ def parse_track_item(item: dict[str, Any]) -> TrackMeta | None:
     )
 
 
-async def fetch_single_spotify_embed_meta(
-    client: httpx.AsyncClient, sp_id: str
-) -> TrackMeta | None:
+async def fetch_single_spotify_embed_meta(client: httpx.AsyncClient, sp_id: str) -> TrackMeta | None:
     try:
         r_emb = await client.get(
             f"https://open.spotify.com/embed/track/{sp_id}",
@@ -1806,20 +1530,11 @@ async def fetch_single_spotify_embed_meta(
         )
         if r_emb.status_code != 200:
             return None
-        m = re.search(
-            r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
-            r_emb.text,
-            re.DOTALL,
-        )
+        m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', r_emb.text, re.DOTALL)
         if not m:
             return None
         entity = (
-            json.loads(m.group(1))
-            .get("props", {})
-            .get("pageProps", {})
-            .get("state", {})
-            .get("data", {})
-            .get("entity", {})
+            json.loads(m.group(1)).get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
         )
         if not entity:
             return None
@@ -1831,27 +1546,15 @@ async def fetch_single_spotify_embed_meta(
             if isinstance(a, dict) and (a.get("name") or "").strip()
         ]
         if not artists_list and entity.get("subtitle"):
-            artists_list = [
-                a.strip()
-                for a in str(entity["subtitle"]).replace("\xa0", " ").split(",")
-                if a.strip()
-            ]
+            artists_list = [a.strip() for a in str(entity["subtitle"]).replace("\xa0", " ").split(",") if a.strip()]
         if not title or not artists_list:
             return None
 
         dur_sec = int(entity.get("duration") or 0) // 1000
         rel_iso = str((entity.get("releaseDate") or {}).get("isoString") or "")[:10]
         ext_isrc = (entity.get("externalIds") or {}).get("isrc")
-        cover_sources = (
-            (entity.get("visualIdentity") or {}).get("image")
-            or entity.get("coverArt", {}).get("sources")
-            or []
-        )
-        cover_url = (
-            cover_sources[0].get("url")
-            if cover_sources and isinstance(cover_sources[0], dict)
-            else None
-        )
+        cover_sources = (entity.get("visualIdentity") or {}).get("image") or entity.get("coverArt", {}).get("sources") or []
+        cover_url = cover_sources[0].get("url") if cover_sources and isinstance(cover_sources[0], dict) else None
 
         return TrackMeta(
             spotify_id=sp_id,
@@ -1877,37 +1580,21 @@ async def fetch_embed_session_and_preview(
 ) -> tuple[list[TrackMeta], str | None, str | None, int, int]:
     embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
     logger.info(f"Получаем гостевую сессию Веб-плеера через: {embed_url}")
-    resp = await client.get(
-        embed_url,
-        headers={"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"},
-    )
+    resp = await client.get(embed_url, headers={"User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9"})
     resp.raise_for_status()
 
-    match = re.search(
-        r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
-        resp.text,
-        re.DOTALL,
-    )
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', resp.text, re.DOTALL)
     if not match:
         return [], None, None, 0, 0
 
-    state = (
-        json.loads(match.group(1))
-        .get("props", {})
-        .get("pageProps", {})
-        .get("state", {})
-    )
+    state = json.loads(match.group(1)).get("props", {}).get("pageProps", {}).get("state", {})
     session_obj = state.get("settings", {}).get("session", {})
     embed_access_token: str | None = session_obj.get("accessToken")
     embed_client_id: str | None = session_obj.get("clientId")
 
-    if not embed_access_token and (
-        m_tok := re.search(r'"accessToken"\s*:\s*"([^"]+)"', resp.text)
-    ):
+    if not embed_access_token and (m_tok := re.search(r'"accessToken"\s*:\s*"([^"]+)"', resp.text)):
         embed_access_token = m_tok.group(1)
-    if not embed_client_id and (
-        m_cid := re.search(r'"clientId"\s*:\s*"([a-f0-9]{32})"', resp.text)
-    ):
+    if not embed_client_id and (m_cid := re.search(r'"clientId"\s*:\s*"([a-f0-9]{32})"', resp.text)):
         embed_client_id = m_cid.group(1)
 
     entity = state.get("data", {}).get("entity", {})
@@ -1920,9 +1607,7 @@ async def fetch_embed_session_and_preview(
     filtered_out = 0
     for idx, item in enumerate(track_list, 1):
         uri = item.get("uri", "")
-        if FILTER_UNAVAILABLE_SPOTIFY and (
-            not uri.startswith("spotify:track:") or item.get("isPlayable") is False
-        ):
+        if FILTER_UNAVAILABLE_SPOTIFY and (not uri.startswith("spotify:track:") or item.get("isPlayable") is False):
             filtered_out += 1
             continue
         sp_id = uri.split(":")[-1] if ":" in uri else ""
@@ -1932,17 +1617,10 @@ async def fetch_embed_session_and_preview(
         title = (item.get("title") or "").strip()
         subtitle = (item.get("subtitle") or "").replace("\xa0", " ").strip()
         duration_sec = int(item.get("duration") or 0) // 1000
-        if FILTER_UNAVAILABLE_SPOTIFY and (
-            not title
-            or not subtitle
-            or subtitle.lower() == "unknown"
-            or duration_sec <= 0
-        ):
+        if FILTER_UNAVAILABLE_SPOTIFY and (not title or not subtitle or subtitle.lower() == "unknown" or duration_sec <= 0):
             filtered_out += 1
             continue
-        artists_all = [a.strip() for a in subtitle.split(",") if a.strip()] or [
-            "Unknown"
-        ]
+        artists_all = [a.strip() for a in subtitle.split(",") if a.strip()] or ["Unknown"]
         tracks.append(
             TrackMeta(
                 spotify_id=sp_id,
@@ -1962,9 +1640,7 @@ async def fetch_embed_session_and_preview(
     return tracks, embed_access_token, embed_client_id, raw_count, filtered_out
 
 
-async def fetch_remote_snapshot_id(
-    client: httpx.AsyncClient, playlist_id: str, web_token: str
-) -> str:
+async def fetch_remote_snapshot_id(client: httpx.AsyncClient, playlist_id: str, web_token: str) -> str:
     try:
         r = await client.get(
             f"https://api.spotify.com/v1/playlists/{playlist_id}",
@@ -1978,9 +1654,7 @@ async def fetch_remote_snapshot_id(
     return ""
 
 
-async def get_spotify_client_token(
-    client: httpx.AsyncClient, web_client_id: str | None
-) -> str | None:
+async def get_spotify_client_token(client: httpx.AsyncClient, web_client_id: str | None) -> str | None:
     cid = web_client_id or "d8a5ed958d274c2e8ee717e6a4b0971d"
     payload = {
         "client_data": {
@@ -2000,15 +1674,9 @@ async def get_spotify_client_token(
         r = await client.post(
             "https://clienttoken.spotify.com/v1/clienttoken",
             json=payload,
-            headers={
-                "User-Agent": BROWSER_UA,
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
+            headers={"User-Agent": BROWSER_UA, "Accept": "application/json", "Content-Type": "application/json"},
         )
-        if r.status_code == 200 and (
-            tok := r.json().get("granted_token", {}).get("token")
-        ):
+        if r.status_code == 200 and (tok := r.json().get("granted_token", {}).get("token")):
             logger.info("Получен client-token для GraphQL Pathfinder.")
             return str(tok)
     except Exception as e:
@@ -2016,22 +1684,13 @@ async def get_spotify_client_token(
     return None
 
 
-async def discover_dynamic_graphql_hashes(
-    client: httpx.AsyncClient, playlist_id: str
-) -> list[str]:
+async def discover_dynamic_graphql_hashes(client: httpx.AsyncClient, playlist_id: str) -> list[str]:
     discovered: list[str] = []
     try:
-        r = await client.get(
-            f"https://open.spotify.com/playlist/{playlist_id}",
-            headers={"User-Agent": BROWSER_UA},
-            follow_redirects=True,
-        )
+        r = await client.get(f"https://open.spotify.com/playlist/{playlist_id}", headers={"User-Agent": BROWSER_UA}, follow_redirects=True)
         if r.status_code != 200:
             return discovered
-        js_urls = re.findall(
-            r'src="(https://[^"]+spotifycdn\.com/cdn/build/web-player/[^"]+\.js)"',
-            r.text,
-        )
+        js_urls = re.findall(r'src="(https://[^"]+spotifycdn\.com/cdn/build/web-player/[^"]+\.js)"', r.text)
         for js_url in js_urls[:8]:
             try:
                 jr = await client.get(js_url, headers={"User-Agent": BROWSER_UA})
@@ -2044,9 +1703,7 @@ async def discover_dynamic_graphql_hashes(
                         h = m1 or m2
                         if h and h not in discovered:
                             discovered.append(h)
-                            logger.info(
-                                f"Найден актуальный sha256Hash в JS-бандле Spotify: {h[:16]}..."
-                            )
+                            logger.info(f"Найден актуальный sha256Hash в JS-бандле Spotify: {h[:16]}...")
             except Exception:
                 continue
     except Exception as e:
@@ -2061,9 +1718,7 @@ async def fetch_via_pathfinder_graphql(
     web_client_id: str | None = None,
     pt_token: str = "",
 ) -> tuple[list[TrackMeta] | None, int, int, str | None]:
-    logger.info(
-        "[СПОСОБ 1 | GRAPHQL] Запрашиваем все страницы плейлиста (500+ треков) через Pathfinder..."
-    )
+    logger.info("[СПОСОБ 1 | GRAPHQL] Запрашиваем все страницы плейлиста (500+ треков) через Pathfinder...")
     client_token = await get_spotify_client_token(client, web_client_id)
     headers = {
         "Authorization": f"Bearer {web_token}",
@@ -2107,9 +1762,7 @@ async def fetch_via_pathfinder_graphql(
                     payload = {
                         "operationName": op_name,
                         "variables": variables,
-                        "extensions": {
-                            "persistedQuery": {"version": 1, "sha256Hash": h}
-                        },
+                        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": h}},
                     }
                     try:
                         r = await client.post(gql_url, headers=headers, json=payload)
@@ -2134,9 +1787,7 @@ async def fetch_via_pathfinder_graphql(
                 break
 
         if not page_data:
-            logger.warning(
-                f"GraphQL Pathfinder не отдал страницу (offset: {offset}). Ответ: {last_err_text}"
-            )
+            logger.warning(f"GraphQL Pathfinder не отдал страницу (offset: {offset}). Ответ: {last_err_text}")
             break
 
         content = page_data.get("data", {}).get("playlistV2", {}).get("content", {})
@@ -2150,19 +1801,13 @@ async def fetch_via_pathfinder_graphql(
             if (item_v2.get("__typename") if item_v2 else "") != "Track":
                 filtered_local_count += 1
                 continue
-            if (
-                FILTER_UNAVAILABLE_SPOTIFY
-                and item_v2.get("playability", {}).get("playable") is False
-            ):
+            if FILTER_UNAVAILABLE_SPOTIFY and item_v2.get("playability", {}).get("playable") is False:
                 filtered_local_count += 1
                 continue
 
             uri = item_v2.get("uri", "")
             sp_id = uri.split(":")[-1] if ":" in uri else ""
-            if not sp_id or (
-                FILTER_UNAVAILABLE_SPOTIFY
-                and (not uri.startswith("spotify:track:") or len(sp_id) != 22)
-            ):
+            if not sp_id or (FILTER_UNAVAILABLE_SPOTIFY and (not uri.startswith("spotify:track:") or len(sp_id) != 22)):
                 filtered_local_count += 1
                 continue
 
@@ -2173,12 +1818,7 @@ async def fetch_via_pathfinder_graphql(
                 if a.get("profile", {}).get("name", "").strip()
             ]
             dur_ms = int(item_v2.get("trackDuration", {}).get("totalMilliseconds") or 0)
-            if FILTER_UNAVAILABLE_SPOTIFY and (
-                not title
-                or not artists_all
-                or artists_all[0].lower() == "unknown"
-                or dur_ms <= 0
-            ):
+            if FILTER_UNAVAILABLE_SPOTIFY and (not title or not artists_all or artists_all[0].lower() == "unknown" or dur_ms <= 0):
                 filtered_local_count += 1
                 continue
 
@@ -2194,9 +1834,7 @@ async def fetch_via_pathfinder_graphql(
                     artists_all=artists_all,
                     album=album_obj.get("name") or "Single",
                     album_artist=artists_all[0],
-                    release_date=str(
-                        date_obj.get("isoString") or date_obj.get("year") or ""
-                    )[:10],
+                    release_date=str(date_obj.get("isoString") or date_obj.get("year") or "")[:10],
                     track_number=str(item_v2.get("trackNumber") or idx),
                     disc_number=str(item_v2.get("discNumber") or 1),
                     duration_sec=dur_ms // 1000,
@@ -2225,9 +1863,7 @@ def score_external_meta_candidate(
     if not cand_title.strip() or not cand_artists:
         return -1.0, "пустое название или артист"
 
-    ver_ok, ver_reason = check_version_compatibility(
-        cand_title, " ".join(cand_artists), cand_album, meta
-    )
+    ver_ok, ver_reason = check_version_compatibility(cand_title, " ".join(cand_artists), cand_album, meta)
     if not ver_ok:
         return -1.0, f"несовпадение версии ({ver_reason})"
 
@@ -2246,17 +1882,9 @@ def score_external_meta_candidate(
         or titles_phonetically_match(meta.clean_title, cand_title)
     )
 
-    dur_diff = (
-        abs(cand_duration_sec - meta.duration_sec)
-        if (meta.duration_sec > 0 and cand_duration_sec > 0)
-        else 0
-    )
-    sp_alb_clean = (
-        re.sub(r"\s*-\s*(?:ep|single).*$", "", meta.album, flags=re.I).strip().lower()
-    )
-    cand_alb_clean = (
-        re.sub(r"\s*-\s*(?:ep|single).*$", "", cand_album, flags=re.I).strip().lower()
-    )
+    dur_diff = abs(cand_duration_sec - meta.duration_sec) if (meta.duration_sec > 0 and cand_duration_sec > 0) else 0
+    sp_alb_clean = re.sub(r"\s*-\s*(?:ep|single).*$", "", meta.album, flags=re.I).strip().lower()
+    cand_alb_clean = re.sub(r"\s*-\s*(?:ep|single).*$", "", cand_album, flags=re.I).strip().lower()
     album_exact = bool(
         sp_alb_clean
         and cand_alb_clean
@@ -2268,66 +1896,34 @@ def score_external_meta_candidate(
         )
     )
 
-    expected_artists = [
-        a for a in meta.artists_all if a.strip()
-    ] + extract_expected_remixer_tokens(meta.title)
-    primary_artist_match = any(
-        artists_loosely_match(meta.artist, ca) for ca in cand_artists if ca.strip()
-    )
+    expected_artists = [a for a in meta.artists_all if a.strip()] + extract_expected_remixer_tokens(meta.title)
+    primary_artist_match = any(artists_loosely_match(meta.artist, ca) for ca in cand_artists if ca.strip())
     any_artist_match = primary_artist_match or any(
-        artists_loosely_match(sp_a, ca)
-        for sp_a in expected_artists
-        for ca in cand_artists
-        if ca.strip()
+        artists_loosely_match(sp_a, ca) for sp_a in expected_artists for ca in cand_artists if ca.strip()
     )
 
     if not any_artist_match:
-        cjk_artist_cross = any(
-            has_cjk_chars(meta.artist) != has_cjk_chars(ca)
-            for ca in cand_artists
-            if ca.strip()
-        )
-        if (
-            cjk_artist_cross
-            and title_exact
-            and meta.duration_sec > 0
-            and cand_duration_sec > 0
-            and dur_diff <= 4
-        ):
+        cjk_artist_cross = any(has_cjk_chars(meta.artist) != has_cjk_chars(ca) for ca in cand_artists if ca.strip())
+        if cjk_artist_cross and title_exact and meta.duration_sec > 0 and cand_duration_sec > 0 and dur_diff <= 4:
             any_artist_match = True
         else:
-            return (
-                -1.0,
-                f"чужой артист ({', '.join(cand_artists[:2])} != {meta.artist})",
-            )
+            return -1.0, f"чужой артист ({', '.join(cand_artists[:2])} != {meta.artist})"
 
     if not title_exact:
         sp_tokens = normalize_tokens(meta.base_title)
-        cand_tokens = set(normalize_tokens(cand_base)) | set(
-            normalize_tokens(cand_title)
-        )
-        overlap = (
-            (sum(1 for w in sp_tokens if w in cand_tokens) / len(sp_tokens))
-            if sp_tokens
-            else 0.0
-        )
+        cand_tokens = set(normalize_tokens(cand_base)) | set(normalize_tokens(cand_title))
+        overlap = (sum(1 for w in sp_tokens if w in cand_tokens) / len(sp_tokens)) if sp_tokens else 0.0
         substring_ok = (
             min(len(sp_base_comp), len(cand_base_comp)) >= 4
             and (sp_base_comp in cand_base_comp or cand_base_comp in sp_base_comp)
         ) or (
             min(len(sp_translit_comp), len(cand_translit_comp)) >= 4
-            and (
-                sp_translit_comp in cand_translit_comp
-                or cand_translit_comp in sp_translit_comp
-            )
+            and (sp_translit_comp in cand_translit_comp or cand_translit_comp in sp_translit_comp)
         )
         cjk_title_cross = (
             has_cjk_chars(meta.base_title) != has_cjk_chars(cand_base)
             and primary_artist_match
-            and (
-                (meta.duration_sec > 0 and cand_duration_sec > 0 and dur_diff <= 5)
-                or album_exact
-            )
+            and ((meta.duration_sec > 0 and cand_duration_sec > 0 and dur_diff <= 5) or album_exact)
         )
         if overlap < 0.70 and not substring_ok and not cjk_title_cross:
             return -1.0, f"чужое название ('{cand_title}' != '{meta.title}')"
@@ -2358,38 +1954,20 @@ def score_external_meta_candidate(
     return score, "OK"
 
 
-async def try_spotify_embed_track(
-    client: httpx.AsyncClient, tr: TrackMeta
-) -> tuple[bool, str]:
+async def try_spotify_embed_track(client: httpx.AsyncClient, tr: TrackMeta) -> tuple[bool, str]:
     if tr.release_date and tr.isrc:
         return True, "OK"
     try:
-        r_emb = await client.get(
-            f"https://open.spotify.com/embed/track/{tr.spotify_id}",
-            headers={"User-Agent": BROWSER_UA},
-        )
+        r_emb = await client.get(f"https://open.spotify.com/embed/track/{tr.spotify_id}", headers={"User-Agent": BROWSER_UA})
         if r_emb.status_code == 200:
-            if m := re.search(
-                r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>',
-                r_emb.text,
-                re.DOTALL,
-            ):
+            if m := re.search(r'<script id="__NEXT_DATA__" type="application/json">(.+?)</script>', r_emb.text, re.DOTALL):
                 entity = (
-                    json.loads(m.group(1))
-                    .get("props", {})
-                    .get("pageProps", {})
-                    .get("state", {})
-                    .get("data", {})
-                    .get("entity", {})
+                    json.loads(m.group(1)).get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
                 )
                 if entity:
-                    if (
-                        rel_iso := (entity.get("releaseDate") or {}).get("isoString")
-                    ) and not tr.release_date:
+                    if (rel_iso := (entity.get("releaseDate") or {}).get("isoString")) and not tr.release_date:
                         tr.release_date = str(rel_iso)[:10]
-                    if (
-                        ext_isrc := (entity.get("externalIds") or {}).get("isrc")
-                    ) and not tr.isrc:
+                    if (ext_isrc := (entity.get("externalIds") or {}).get("isrc")) and not tr.isrc:
                         tr.isrc = str(ext_isrc).strip()
                     if tr.release_year != "N/A":
                         return tr.has_full_meta, f"Embed дал Год: {tr.release_year}"
@@ -2409,22 +1987,12 @@ async def enrich_via_apple_itunes(
             q_term = f"{tr.artist} {tr.clean_title}"
             r = await ext_client.get(
                 "https://itunes.apple.com/search",
-                params={
-                    "term": q_term,
-                    "entity": "song",
-                    "limit": 10,
-                    "country": SPOTIFY_MARKET,
-                },
+                params={"term": q_term, "entity": "song", "limit": 10, "country": SPOTIFY_MARKET},
             )
             if r.status_code == 400 and SPOTIFY_MARKET.upper() != "US":
                 r = await ext_client.get(
                     "https://itunes.apple.com/search",
-                    params={
-                        "term": q_term,
-                        "entity": "song",
-                        "limit": 10,
-                        "country": "US",
-                    },
+                    params={"term": q_term, "entity": "song", "limit": 10, "country": "US"},
                 )
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}"
@@ -2437,9 +2005,7 @@ async def enrich_via_apple_itunes(
             last_reject = "не подошел по длительности/артисту"
             for item in results:
                 sc, reason = score_external_meta_candidate(
-                    cand_title=str(
-                        item.get("trackName") or item.get("trackCensoredName") or ""
-                    ).strip(),
+                    cand_title=str(item.get("trackName") or item.get("trackCensoredName") or "").strip(),
                     cand_artists=[str(item.get("artistName") or "").strip()],
                     cand_duration_sec=int(item.get("trackTimeMillis") or 0) // 1000,
                     cand_album=str(item.get("collectionName") or "").strip(),
@@ -2456,13 +2022,9 @@ async def enrich_via_apple_itunes(
             scored_items.sort(key=lambda x: x[0], reverse=True)
             best_item = scored_items[0][1]
 
-            if (
-                rel_d := str(best_item.get("releaseDate") or "")[:10]
-            ) and not tr.release_date:
+            if (rel_d := str(best_item.get("releaseDate") or "")[:10]) and not tr.release_date:
                 tr.release_date = rel_d
-            if (
-                col_name := (best_item.get("collectionName") or "").strip()
-            ) and tr.album in ("Single", "Spotify Playlist", ""):
+            if (col_name := (best_item.get("collectionName") or "").strip()) and tr.album in ("Single", "Spotify Playlist", ""):
                 tr.album = re.sub(r"\s*-\s*Single$", "", col_name, flags=re.I)
 
             return True, f"получен Год: {tr.release_year}"
@@ -2480,9 +2042,7 @@ async def enrich_via_musicbrainz(
             await asyncio.sleep(1.1)
             safe_art = re.sub(r'["\\+\-&|!(){}\[\]^~*?:\/]', " ", tr.artist).strip()
             safe_tit = re.sub(r'["\\+\-&|!(){}\[\]^~*?:\/]', " ", tr.base_title).strip()
-            headers = {
-                "User-Agent": "SpotiSyncRadio/7.3 ( https://github.com/spotisync )"
-            }
+            headers = {"User-Agent": "SpotiSyncRadio/7.3 ( https://github.com/spotisync )"}
 
             queries = [f'artist:"{safe_art}" AND recording:"{safe_tit}"']
             if len(safe_tit) >= 2:
@@ -2525,22 +2085,14 @@ async def enrich_via_musicbrainz(
                             if isinstance(art_obj, dict):
                                 if o_name := str(art_obj.get("name") or "").strip():
                                     mb_artists.append(o_name)
-                                if sort_name := str(
-                                    art_obj.get("sort-name") or ""
-                                ).strip():
+                                if sort_name := str(art_obj.get("sort-name") or "").strip():
                                     mb_artists.append(sort_name)
                                 for al in art_obj.get("aliases") or []:
-                                    if isinstance(al, dict) and (
-                                        al_name := str(al.get("name") or "").strip()
-                                    ):
+                                    if isinstance(al, dict) and (al_name := str(al.get("name") or "").strip()):
                                         mb_artists.append(al_name)
 
                     releases = rec.get("releases") or []
-                    first_album = (
-                        str(releases[0].get("title") or "")
-                        if releases and isinstance(releases[0], dict)
-                        else ""
-                    )
+                    first_album = str(releases[0].get("title") or "") if releases and isinstance(releases[0], dict) else ""
 
                     sc, reason = score_external_meta_candidate(
                         cand_title=rec_title,
@@ -2552,9 +2104,7 @@ async def enrich_via_musicbrainz(
                     if sc > 0:
                         if rec_len_sec <= 0:
                             if not has_isrc:
-                                last_reject = (
-                                    "в записи MusicBrainz нет ни длительности, ни ISRC"
-                                )
+                                last_reject = "в записи MusicBrainz нет ни длительности, ни ISRC"
                                 continue
                             sc -= 15.0
                         scored_recs.append((sc + (30.0 if has_isrc else 0.0), rec))
@@ -2566,16 +2116,8 @@ async def enrich_via_musicbrainz(
                     for _, best_rec in scored_recs:
                         if (isrc_list := best_rec.get("isrcs") or []) and not tr.isrc:
                             first_isrc = isrc_list[0]
-                            tr.isrc = str(
-                                first_isrc.get("id")
-                                if isinstance(first_isrc, dict)
-                                else first_isrc
-                            ).strip()
-                        if (
-                            first_rel := str(best_rec.get("first-release-date") or "")[
-                                :10
-                            ]
-                        ) and not tr.release_date:
+                            tr.isrc = str(first_isrc.get("id") if isinstance(first_isrc, dict) else first_isrc).strip()
+                        if (first_rel := str(best_rec.get("first-release-date") or "")[:10]) and not tr.release_date:
                             tr.release_date = first_rel
                         if tr.isrc:
                             return tr.has_full_meta, "OK (MusicBrainz)"
@@ -2592,9 +2134,7 @@ async def enrich_single_track_via_deezer(
     dz_sem: asyncio.Semaphore,
     tr: TrackMeta,
 ) -> tuple[bool, str]:
-    async def dz_get_json(
-        url: str, params: dict[str, Any] | None = None
-    ) -> tuple[dict[str, Any], str]:
+    async def dz_get_json(url: str, params: dict[str, Any] | None = None) -> tuple[dict[str, Any], str]:
         last_err = ""
         for retry in range(4):
             try:
@@ -2608,10 +2148,7 @@ async def enrich_single_track_via_deezer(
                             last_err = "Quota limit (code 4)"
                             await asyncio.sleep(1.2 * (retry + 1))
                             continue
-                        return (
-                            {},
-                            f"Deezer error {err_code}: {err_obj.get('message', 'Unknown')}",
-                        )
+                        return {}, f"Deezer error {err_code}: {err_obj.get('message', 'Unknown')}"
                     return (rj if isinstance(rj, dict) else {}), ""
                 if r.status_code == 429:
                     last_err = "HTTP 429"
@@ -2627,32 +2164,25 @@ async def enrich_single_track_via_deezer(
     async with dz_sem:
         await asyncio.sleep(0.12)
         q_strict = f'artist:"{tr.artist}" track:"{tr.clean_title}"'
-        rj, err_s = await dz_get_json(
-            "https://api.deezer.com/search", params={"q": q_strict, "limit": 10}
-        )
+        rj, err_s = await dz_get_json("https://api.deezer.com/search", params={"q": q_strict, "limit": 10})
         data: list[dict[str, Any]] = list(rj.get("data") or [])
 
         if not data and tr.clean_title != tr.base_title:
             rj_b, _ = await dz_get_json(
                 "https://api.deezer.com/search",
-                params={
-                    "q": f'artist:"{tr.artist}" track:"{tr.base_title}"',
-                    "limit": 10,
-                },
+                params={"q": f'artist:"{tr.artist}" track:"{tr.base_title}"', "limit": 10},
             )
             data = list(rj_b.get("data") or [])
 
         if not data:
             rj2, _ = await dz_get_json(
-                "https://api.deezer.com/search",
-                params={"q": f"{tr.artist} {tr.clean_title}", "limit": 10},
+                "https://api.deezer.com/search", params={"q": f"{tr.artist} {tr.clean_title}", "limit": 10}
             )
             data = list(rj2.get("data") or [])
 
         if not data and len(tr.base_title) >= 3:
             rj3, err_t = await dz_get_json(
-                "https://api.deezer.com/search",
-                params={"q": f'track:"{tr.base_title}"', "limit": 12},
+                "https://api.deezer.com/search", params={"q": f'track:"{tr.base_title}"', "limit": 12}
             )
             data = list(rj3.get("data") or [])
             if not data:
@@ -2701,9 +2231,7 @@ async def enrich_single_track_via_deezer(
                 if isinstance(c, dict) and c.get("name")
             ]
             main_art = str((tj.get("artist") or {}).get("name") or "").strip()
-            all_dz_artists = list(
-                dict.fromkeys(([main_art] if main_art else []) + contributors)
-            )
+            all_dz_artists = list(dict.fromkeys(([main_art] if main_art else []) + contributors))
             full_title = str(tj.get("title") or "").strip()
             full_ver = str(tj.get("title_version") or "").strip()
             if full_ver and full_ver.lower() not in full_title.lower():
@@ -2722,14 +2250,10 @@ async def enrich_single_track_via_deezer(
 
             if not tr.isrc and tj.get("isrc"):
                 tr.isrc = str(tj["isrc"]).strip()
-            rel_d = tj.get("release_date") or (tj.get("album") or {}).get(
-                "release_date"
-            )
+            rel_d = tj.get("release_date") or (tj.get("album") or {}).get("release_date")
             if not tr.release_date and rel_d and str(rel_d) != "0000-00-00":
                 tr.release_date = str(rel_d).strip()
-            if tr.album in ("Single", "Spotify Playlist", "") and (
-                tj.get("album") or {}
-            ).get("title"):
+            if tr.album in ("Single", "Spotify Playlist", "") and (tj.get("album") or {}).get("title"):
                 tr.album = str(tj["album"]["title"]).strip()
 
             if tr.has_full_meta:
@@ -2740,9 +2264,7 @@ async def enrich_single_track_via_deezer(
                 missing_parts.append("пустой ISRC")
             if tr.release_year == "N/A":
                 missing_parts.append("пустой год")
-            last_reject_reason = f"найден ID: {matched_id}, но " + " и ".join(
-                missing_parts
-            )
+            last_reject_reason = f"найден ID: {matched_id}, но " + " и ".join(missing_parts)
 
         return False, last_reject_reason
 
@@ -2779,32 +2301,22 @@ async def enrich_tracks_metadata(
 
             if is_valid_spotify_track(t):
                 enriched_result.append(t)
-                if (
-                    not t.isrc or t.release_year == "N/A"
-                ) and not t.spotify_id.startswith("custom_"):
+                if (not t.isrc or t.release_year == "N/A") and not t.spotify_id.startswith("custom_"):
                     to_fetch_indices.append(i)
             else:
                 enriched_result.append(None)
                 pre_filtered += 1
 
     if not to_fetch_indices:
-        logger.info(
-            "Метаданные всех треков (ISRC, альбомы, года) мгновенно взяты из локального кэша!"
-        )
-        return [
-            t for t in enriched_result if t is not None and is_valid_spotify_track(t)
-        ], pre_filtered
+        logger.info("Метаданные всех треков (ISRC, альбомы, года) мгновенно взяты из локального кэша!")
+        return [t for t in enriched_result if t is not None and is_valid_spotify_track(t)], pre_filtered
 
     total_to_enrich = len(to_fetch_indices)
     logger.info(
         f"Запускаем каскад обогащения метаданных (Spotify -> Deezer [Strict Scorer] -> MusicBrainz -> Apple Music) для {total_to_enrich} треков..."
     )
 
-    headers = (
-        {"Authorization": f"Bearer {web_token}", "User-Agent": BROWSER_UA}
-        if web_token
-        else {}
-    )
+    headers = {"Authorization": f"Bearer {web_token}", "User-Agent": BROWSER_UA} if web_token else {}
     sp_sem = asyncio.Semaphore(6)
     dz_sem = asyncio.Semaphore(5)
     mb_sem = asyncio.Semaphore(1)
@@ -2812,24 +2324,13 @@ async def enrich_tracks_metadata(
 
     spotify_rest_cooldown_until: float = 0.0
     spotify_rest_long_ban_logged = False
-    api_filtered = ok_spotify = ok_deezer = ok_mb_apple = partial_ok = failed_all = (
-        processed_count
-    ) = 0
+    api_filtered = ok_spotify = ok_deezer = ok_mb_apple = partial_ok = failed_all = processed_count = 0
 
     ext_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
-    async with httpx.AsyncClient(
-        timeout=15.0, headers={"User-Agent": BROWSER_UA}, limits=ext_limits
-    ) as ext_client:
+    async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": BROWSER_UA}, limits=ext_limits) as ext_client:
 
         async def enrich_single_track_chain(idx: int) -> None:
-            nonlocal \
-                api_filtered, \
-                ok_spotify, \
-                ok_deezer, \
-                ok_mb_apple, \
-                partial_ok, \
-                failed_all, \
-                processed_count
+            nonlocal api_filtered, ok_spotify, ok_deezer, ok_mb_apple, partial_ok, failed_all, processed_count
             nonlocal spotify_rest_cooldown_until, spotify_rest_long_ban_logged
             if is_shutting_down():
                 return
@@ -2863,34 +2364,21 @@ async def enrich_tracks_metadata(
                                             parsed.direct_url = tr.direct_url
                                             enriched_result[idx] = parsed
                                             tr = parsed
-                                        elif (
-                                            FILTER_UNAVAILABLE_SPOTIFY
-                                            and not tr.direct_url
-                                        ):
+                                        elif FILTER_UNAVAILABLE_SPOTIFY and not tr.direct_url:
                                             enriched_result[idx] = None
                                             api_filtered += 1
                                             return
                                     elif r.status_code == 429:
                                         ra = float(r.headers.get("Retry-After") or 10.0)
-                                        spotify_rest_cooldown_until = max(
-                                            spotify_rest_cooldown_until,
-                                            time.monotonic() + ra,
-                                        )
+                                        spotify_rest_cooldown_until = max(spotify_rest_cooldown_until, time.monotonic() + ra)
                                         sp_reason = f"REST 429 ({format_duration(ra)})"
-                                        if (
-                                            ra > 15.0
-                                            and not spotify_rest_long_ban_logged
-                                        ):
+                                        if ra > 15.0 and not spotify_rest_long_ban_logged:
                                             spotify_rest_long_ban_logged = True
                                             logger.warning(
                                                 f"[SPOTIFY 429 BYPASS] REST /v1/tracks в тайм-ауте на {format_duration(ra)}. "
                                                 f"Годы выпуска берем из Spotify Embed, а ISRC — из Deezer (Strict Scorer) и MusicBrainz!"
                                             )
-                                    elif (
-                                        r.status_code in (400, 404)
-                                        and FILTER_UNAVAILABLE_SPOTIFY
-                                        and not tr.direct_url
-                                    ):
+                                    elif r.status_code in (400, 404) and FILTER_UNAVAILABLE_SPOTIFY and not tr.direct_url:
                                         enriched_result[idx] = None
                                         api_filtered += 1
                                         return
@@ -2912,33 +2400,25 @@ async def enrich_tracks_metadata(
                         _, emb_msg = await try_spotify_embed_track(client, tr)
                     sp_reason = f"{sp_reason}, {emb_msg}".strip(", ")
                 else:
-                    sp_reason = f"{sp_reason}, Год: {tr.release_year} (GraphQL)".strip(
-                        ", "
-                    )
+                    sp_reason = f"{sp_reason}, Год: {tr.release_year} (GraphQL)".strip(", ")
 
                 if tr.has_full_meta:
                     ok_spotify += 1
                     return
 
-                dz_ok, dz_reason = await enrich_single_track_via_deezer(
-                    ext_client, dz_sem, tr
-                )
+                dz_ok, dz_reason = await enrich_single_track_via_deezer(ext_client, dz_sem, tr)
                 if dz_ok and tr.has_full_meta:
                     ok_deezer += 1
                     return
 
                 if not tr.isrc:
-                    mb_ok, mb_reason = await enrich_via_musicbrainz(
-                        ext_client, mb_sem, tr
-                    )
+                    mb_ok, mb_reason = await enrich_via_musicbrainz(ext_client, mb_sem, tr)
                     if mb_ok and tr.has_full_meta:
                         ok_mb_apple += 1
                         return
 
                 if tr.release_year == "N/A":
-                    _, apple_reason = await enrich_via_apple_itunes(
-                        ext_client, apple_sem, tr
-                    )
+                    _, apple_reason = await enrich_via_apple_itunes(ext_client, apple_sem, tr)
                     if tr.has_full_meta:
                         ok_mb_apple += 1
                         return
@@ -2962,9 +2442,7 @@ async def enrich_tracks_metadata(
                 logger.warning(f"[ENRICH EXCEPTION] Сбой обогащения трека #{idx}: {e}")
             finally:
                 processed_count += 1
-                if (
-                    processed_count % 25 == 0 or processed_count == total_to_enrich
-                ) and not is_shutting_down():
+                if (processed_count % 25 == 0 or processed_count == total_to_enrich) and not is_shutting_down():
                     pct = int((processed_count / total_to_enrich) * 100)
                     logger.info(
                         f"[ENRICH PROGRESS] Обработано: {processed_count}/{total_to_enrich} ({pct}%) | "
@@ -2972,13 +2450,9 @@ async def enrich_tracks_metadata(
                         f"Только Год (Spotify Embed): {partial_ok} | Отказов: {failed_all}"
                     )
 
-        await asyncio.gather(
-            *(enrich_single_track_chain(idx) for idx in to_fetch_indices)
-        )
+        await asyncio.gather(*(enrich_single_track_chain(idx) for idx in to_fetch_indices))
 
-    final_list = [
-        t for t in enriched_result if t is not None and is_valid_spotify_track(t)
-    ]
+    final_list = [t for t in enriched_result if t is not None and is_valid_spotify_track(t)]
     return final_list, (pre_filtered + api_filtered)
 
 
@@ -2997,31 +2471,21 @@ async def fetch_spotify_tracks_with_cache(
         limits = httpx.Limits(max_keepalive_connections=15, max_connections=25)
         async with httpx.AsyncClient(timeout=25.0, limits=limits) as client:
             t_parse_start = time.monotonic()
-            (
-                embed_tracks,
-                web_token,
-                web_client_id,
-                emb_raw_total,
-                emb_filtered,
-            ) = await fetch_embed_session_and_preview(client, playlist_id)
+            embed_tracks, web_token, web_client_id, emb_raw_total, emb_filtered = await fetch_embed_session_and_preview(
+                client, playlist_id
+            )
             if not web_token and not embed_tracks:
                 raise RuntimeError("Не удалось получить сессию с open.spotify.com!")
 
-            remote_snapshot = (
-                await fetch_remote_snapshot_id(client, playlist_id, web_token)
-                if web_token
-                else ""
-            )
+            remote_snapshot = await fetch_remote_snapshot_id(client, playlist_id, web_token) if web_token else ""
             cached_snapshot = cache_data.get("snapshot_id", "")
             cached_url = cache_data.get("playlist_url", "")
             cached_tracks_dict = cache_data.get("tracks", {})
             is_full_cached = cache_data.get("is_full_playlist", False)
 
-            has_isrc_in_cache = sum(
-                1
-                for e in cached_tracks_dict.values()
-                if (e.get("meta") or {}).get("isrc")
-            ) > (len(cached_tracks_dict) // 2)
+            has_isrc_in_cache = sum(1 for e in cached_tracks_dict.values() if (e.get("meta") or {}).get("isrc")) > (
+                len(cached_tracks_dict) // 2
+            )
 
             if (
                 remote_snapshot
@@ -3032,22 +2496,22 @@ async def fetch_spotify_tracks_with_cache(
                 and len(cached_tracks_dict) > 0
             ):
                 parse_dt = max(time.monotonic() - t_parse_start, 0.01)
-                tracks_from_cache = [
+                all_valid_cached = [
                     tr_obj
                     for k, e in cached_tracks_dict.items()
                     if not str(k).startswith("custom_")
                     and is_valid_spotify_track(tr_obj := TrackMeta.from_dict(e["meta"]))
-                    and not (
-                        ignored_keys and is_track_in_ignore_set(tr_obj, ignored_keys)
-                    )
                 ]
-                raw_tot = int(
-                    cache_data.get("raw_playlist_total") or len(tracks_from_cache)
-                )
-                filt_cnt = max(
-                    int(cache_data.get("filtered_unavailable_count") or 0),
-                    max(0, raw_tot - len(tracks_from_cache)),
-                )
+                tracks_from_cache = [
+                    tr_obj
+                    for tr_obj in all_valid_cached
+                    if not (ignored_keys and is_track_in_ignore_set(tr_obj, ignored_keys))
+                ]
+                ign_cached_cnt = len(all_valid_cached) - len(tracks_from_cache)
+                if ign_cached_cnt > 0:
+                    logger.info(f"[SPOTITRACKS IGNORES] Исключено из кэша по списку ignores: {ign_cached_cnt} треков.")
+                raw_tot = int(cache_data.get("raw_playlist_total") or len(all_valid_cached))
+                filt_cnt = max(int(cache_data.get("filtered_unavailable_count") or 0) + ign_cached_cnt, max(0, raw_tot - len(tracks_from_cache)))
                 full_meta_cnt = sum(1 for t in tracks_from_cache if t.has_full_meta)
                 logger.info(
                     f"[CACHE HIT] Плейлист не изменился (snapshot_id: {remote_snapshot[:12]}..., "
@@ -3055,57 +2519,34 @@ async def fetch_spotify_tracks_with_cache(
                     f"Всего в плейлисте: {raw_tot} | Отфильтровано: {filt_cnt} | "
                     f"Финально доступно: {len(tracks_from_cache)} (полные ISRC+Год: {full_meta_cnt}/{len(tracks_from_cache)})"
                 )
-                return (
-                    tracks_from_cache,
-                    remote_snapshot,
-                    True,
-                    raw_tot,
-                    filt_cnt,
-                    parse_dt,
-                    0.0,
-                )
+                return tracks_from_cache, remote_snapshot, True, raw_tot, filt_cnt, parse_dt, 0.0
 
             tracks: list[TrackMeta] = []
             raw_total = total_filtered = 0
             parse_dt = enrich_dt = 0.0
 
             if web_token:
-                (
-                    gql_tracks,
-                    gql_raw_total,
-                    gql_filtered,
-                    _,
-                ) = await fetch_via_pathfinder_graphql(
+                gql_tracks, gql_raw_total, gql_filtered, _ = await fetch_via_pathfinder_graphql(
                     client, playlist_id, web_token, web_client_id, pt_token
                 )
                 if gql_tracks and len(gql_tracks) >= len(embed_tracks):
                     parse_dt = max(time.monotonic() - t_parse_start, 0.01)
                     if ignored_keys:
                         before_ign = len(gql_tracks)
-                        gql_tracks = [
-                            t
-                            for t in gql_tracks
-                            if not is_track_in_ignore_set(t, ignored_keys)
-                        ]
+                        gql_tracks = [t for t in gql_tracks if not is_track_in_ignore_set(t, ignored_keys)]
                         ign_cnt = before_ign - len(gql_tracks)
                         if ign_cnt > 0:
                             gql_filtered += ign_cnt
-                            logger.info(
-                                f"[SPOTITRACKS IGNORES] Пропущено до обогащения по списку ignores: {ign_cnt} треков."
-                            )
+                            logger.info(f"[SPOTITRACKS IGNORES] Пропущено до обогащения по списку ignores: {ign_cnt} треков.")
                     logger.info(
                         f"Плейлист получен со Spotify за {format_duration(parse_dt)} "
-                        f"({int(max(1, len(gql_tracks)) / parse_dt)} треков/сек): "
+                        f"({int(max(1, len(gql_tracks))/parse_dt)} треков/сек): "
                         f"Всего: {gql_raw_total} | Доступно: {len(gql_tracks)} | Отфильтровано на старте: {gql_filtered}"
                     )
                     t_enrich_start = time.monotonic()
-                    tracks, enrich_filtered = await enrich_tracks_metadata(
-                        client, gql_tracks, web_token, cache_data
-                    )
+                    tracks, enrich_filtered = await enrich_tracks_metadata(client, gql_tracks, web_token, cache_data)
                     enrich_dt = max(time.monotonic() - t_enrich_start, 0.01)
-                    raw_total = gql_raw_total or (
-                        len(tracks) + gql_filtered + enrich_filtered
-                    )
+                    raw_total = gql_raw_total or (len(tracks) + gql_filtered + enrich_filtered)
                     total_filtered = gql_filtered + enrich_filtered
                     cache_data["is_full_playlist"] = True
 
@@ -3113,54 +2554,38 @@ async def fetch_spotify_tracks_with_cache(
                 parse_dt = max(time.monotonic() - t_parse_start, 0.01)
                 if ignored_keys:
                     before_ign = len(embed_tracks)
-                    embed_tracks = [
-                        t
-                        for t in embed_tracks
-                        if not is_track_in_ignore_set(t, ignored_keys)
-                    ]
+                    embed_tracks = [t for t in embed_tracks if not is_track_in_ignore_set(t, ignored_keys)]
                     emb_filtered += before_ign - len(embed_tracks)
                 logger.info(
                     f"[СПОСОБ 2 | EMBED] Список из Embed-виджета получен за "
                     f"{format_duration(parse_dt)} (всего в виджете: {emb_raw_total})..."
                 )
                 t_enrich_start = time.monotonic()
-                tracks, enrich_filtered = await enrich_tracks_metadata(
-                    client, embed_tracks, web_token, cache_data
-                )
+                tracks, enrich_filtered = await enrich_tracks_metadata(client, embed_tracks, web_token, cache_data)
                 enrich_dt = max(time.monotonic() - t_enrich_start, 0.01)
                 raw_total = emb_raw_total
                 total_filtered = emb_filtered + enrich_filtered
                 cache_data["is_full_playlist"] = False
 
             if not tracks:
-                raise RuntimeError(
-                    "Spotify вернул 0 доступных треков! Проверьте открытость плейлиста."
-                )
+                raise RuntimeError("Spotify вернул 0 доступных треков! Проверьте открытость плейлиста.")
 
             cache_data["raw_playlist_total"] = raw_total
             cache_data["filtered_unavailable_count"] = total_filtered
 
             full_meta_count = sum(1 for t in tracks if t.has_full_meta)
-            only_isrc_count = sum(
-                1 for t in tracks if t.isrc and t.release_year == "N/A"
-            )
-            only_year_count = sum(
-                1 for t in tracks if not t.isrc and t.release_year != "N/A"
-            )
-            missing_both_count = (
-                len(tracks) - full_meta_count - only_isrc_count - only_year_count
-            )
+            only_isrc_count = sum(1 for t in tracks if t.isrc and t.release_year == "N/A")
+            only_year_count = sum(1 for t in tracks if not t.isrc and t.release_year != "N/A")
+            missing_both_count = len(tracks) - full_meta_count - only_isrc_count - only_year_count
 
             logger.info(
                 f"Обогащение метаданных завершено за {format_duration(enrich_dt)} "
-                f"({len(tracks) / enrich_dt:.1f} треков/сек): "
+                f"({len(tracks)/enrich_dt:.1f} треков/сек): "
                 f"Всего доступно: {len(tracks)} | Успешно (ISRC+Год): {full_meta_count} | "
                 f"Только ISRC: {only_isrc_count} | Только Год: {only_year_count} | Не получено: {missing_both_count}"
             )
 
-            if (
-                LOG_SHOW_PARSED_TRACKS or logger.isEnabledFor(logging.DEBUG)
-            ) and tracks:
+            if (LOG_SHOW_PARSED_TRACKS or logger.isEnabledFor(logging.DEBUG)) and tracks:
                 log_fn = logger.info if LOG_SHOW_PARSED_TRACKS else logger.debug
                 width = len(str(len(tracks)))
                 for idx, t in enumerate(tracks, 1):
@@ -3169,15 +2594,7 @@ async def fetch_spotify_tracks_with_cache(
                         f"Трек: #{t.track_number} | {t.formatted_duration} | ISRC: {t.isrc or 'N/A'} | Файл: {t.id_filename}"
                     )
 
-            return (
-                tracks,
-                remote_snapshot,
-                False,
-                raw_total,
-                total_filtered,
-                parse_dt,
-                enrich_dt,
-            )
+            return tracks, remote_snapshot, False, raw_total, total_filtered, parse_dt, enrich_dt
     finally:
         current_ctx.reset(token_ctx)
 
@@ -3196,9 +2613,7 @@ def keep_alive_youtube_cookies() -> None:
 
         ok_health, health_msg = inspect_cookie_file_health(YT_COOKIE_FILE)
         if not ok_health:
-            logger.error(
-                f"Проверка файла куки не пройдена: {health_msg}! Обновите куки через --auth."
-            )
+            logger.error(f"Проверка файла куки не пройдена: {health_msg}! Обновите куки через --auth.")
             return
 
         adapter = YtdlpLoggerAdapter()
@@ -3213,34 +2628,18 @@ def keep_alive_youtube_cookies() -> None:
             "logger": adapter,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(
-                "https://www.youtube.com/feed/subscriptions", download=False
-            )
+            info = ydl.extract_info("https://www.youtube.com/feed/subscriptions", download=False)
 
         entries = info.get("entries") if isinstance(info, dict) else None
         webpage_url = (info.get("webpage_url") or "") if isinstance(info, dict) else ""
 
-        if (
-            entries is None
-            or "ServiceLogin" in webpage_url
-            or "accounts.google.com" in webpage_url
-        ):
-            yt_reason = (
-                adapter.last_error_msg
-                or adapter.last_warning_msg
-                or "Сессия была сброшена или устарела"
-            )
-            logger.error(
-                f"НЕ УДАЛОСЬ подтвердить авторизацию YouTube ({YT_COOKIE_FILE})! Причина: {yt_reason}."
-            )
+        if entries is None or "ServiceLogin" in webpage_url or "accounts.google.com" in webpage_url:
+            yt_reason = adapter.last_error_msg or adapter.last_warning_msg or "Сессия была сброшена или устарела"
+            logger.error(f"НЕ УДАЛОСЬ подтвердить авторизацию YouTube ({YT_COOKIE_FILE})! Причина: {yt_reason}.")
         else:
-            logger.success(
-                f"Сессия YouTube успешно проверена и продлена ({health_msg})."
-            )
+            logger.success(f"Сессия YouTube успешно проверена и продлена ({health_msg}).")
     except Exception as e:
-        logger.error(
-            f"Ошибка при проверке токена авторизации YouTube ({YT_COOKIE_FILE}): {e}"
-        )
+        logger.error(f"Ошибка при проверке токена авторизации YouTube ({YT_COOKIE_FILE}): {e}")
     finally:
         current_ctx.reset(token_ctx)
 
@@ -3255,56 +2654,24 @@ def compact_alnum(s: str) -> str:
 
 
 def has_cjk_chars(s: str) -> bool:
-    return bool(
-        re.search(
-            r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\uac00-\ud7af]",
-            s,
-        )
-    )
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\uac00-\ud7af]", s))
 
 
 def extract_expected_remixer_tokens(title: str) -> list[str]:
-    matches = re.findall(
-        r"[\(\[]([^\)\]]*?(?:remix|mix|vip|flip|bootleg|vision)[^\)\]]*?)[\)\]]",
-        title,
-        flags=re.I,
-    )
-    ignore = {
-        "remix",
-        "mix",
-        "vip",
-        "official",
-        "audio",
-        "video",
-        "extended",
-        "radio",
-        "edit",
-        "feat",
-        "ft",
-        "version",
-    }
-    return [
-        w
-        for m in matches
-        for w in normalize_tokens(m)
-        if w not in ignore and len(w) >= 3
-    ]
+    matches = re.findall(r"[\(\[]([^\)\]]*?(?:remix|mix|vip|flip|bootleg|vision)[^\)\]]*?)[\)\]]", title, flags=re.I)
+    ignore = {"remix", "mix", "vip", "official", "audio", "video", "extended", "radio", "edit", "feat", "ft", "version"}
+    return [w for m in matches for w in normalize_tokens(m) if w not in ignore and len(w) >= 3]
 
 
-def check_version_compatibility(
-    cand_title: str, uploader: str, description: str, meta: TrackMeta
-) -> tuple[bool, str]:
+def check_version_compatibility(cand_title: str, uploader: str, description: str, meta: TrackMeta) -> tuple[bool, str]:
     title_lower = cand_title.lower()
     orig_title_lower = meta.title.lower()
     orig_combined = f"{orig_title_lower} {meta.album.lower()}"
 
     for word in STOP_WORDS:
-        if contains_word_token(title_lower, word) and not contains_word_token(
-            orig_combined, word
-        ):
+        if contains_word_token(title_lower, word) and not contains_word_token(orig_combined, word):
             allowed_by_group = any(
-                word in group_words
-                and any(contains_word_token(orig_combined, gw) for gw in group_words)
+                word in group_words and any(contains_word_token(orig_combined, gw) for gw in group_words)
                 for _, group_words in VERSION_EQUIVALENCE_GROUPS
             )
             if not allowed_by_group:
@@ -3324,21 +2691,11 @@ def check_version_compatibility(
 
 
 def is_trusted_artist_or_remixer_channel(uploader: str, meta: TrackMeta) -> bool:
-    up_clean = (
-        uploader.lower()
-        .replace(" official", "")
-        .replace(" music", "")
-        .replace("youtube channel", "")
-        .strip()
-    )
+    up_clean = uploader.lower().replace(" official", "").replace(" music", "").replace("youtube channel", "").strip()
     if not up_clean:
         return False
-    all_names = [
-        a.lower().strip() for a in meta.artists_all if a.strip()
-    ] + extract_expected_remixer_tokens(meta.title)
-    return any(
-        len(name) >= 2 and artists_loosely_match(name, up_clean) for name in all_names
-    )
+    all_names = [a.lower().strip() for a in meta.artists_all if a.strip()] + extract_expected_remixer_tokens(meta.title)
+    return any(len(name) >= 2 and artists_loosely_match(name, up_clean) for name in all_names)
 
 
 def has_content_id_music_match(entry: dict[str, Any], meta: TrackMeta) -> bool:
@@ -3346,22 +2703,14 @@ def has_content_id_music_match(entry: dict[str, Any], meta: TrackMeta) -> bool:
     yt_artist = (entry.get("artist") or "").strip()
     if not yt_track or not yt_artist:
         return False
-    if not any(
-        artists_loosely_match(a, yt_artist) for a in meta.artists_all if a.strip()
-    ):
+    if not any(artists_loosely_match(a, yt_artist) for a in meta.artists_all if a.strip()):
         return False
     base_sp = compact_alnum(meta.base_title)
     yt_tr_comp = compact_alnum(yt_track)
     if base_sp and yt_tr_comp and (base_sp in yt_tr_comp or yt_tr_comp in base_sp):
         return True
-    alb_comp = compact_alnum(
-        re.sub(r"\s*-\s*(?:ep|single).*$", "", meta.album, flags=re.I)
-    )
-    return bool(
-        alb_comp
-        and len(alb_comp) >= 4
-        and (alb_comp in yt_tr_comp or yt_tr_comp in alb_comp)
-    )
+    alb_comp = compact_alnum(re.sub(r"\s*-\s*(?:ep|single).*$", "", meta.album, flags=re.I))
+    return bool(alb_comp and len(alb_comp) >= 4 and (alb_comp in yt_tr_comp or yt_tr_comp in alb_comp))
 
 
 def has_title_match(entry: dict[str, Any], meta: TrackMeta) -> bool:
@@ -3382,36 +2731,20 @@ def has_title_match(entry: dict[str, Any], meta: TrackMeta) -> bool:
     target_comp = compact_alnum(target_base)
     cand_comp = compact_alnum(cand_lower)
     track_comp = compact_alnum(track_lower)
-    if (
-        target_comp
-        and len(target_comp) >= 3
-        and (target_comp in cand_comp or (track_comp and target_comp in track_comp))
-    ):
+    if target_comp and len(target_comp) >= 3 and (target_comp in cand_comp or (track_comp and target_comp in track_comp)):
         return True
 
-    sp_album_clean = re.sub(
-        r"\s*-\s*(?:ep|single).*$", "", meta.album, flags=re.I
-    ).strip()
+    sp_album_clean = re.sub(r"\s*-\s*(?:ep|single).*$", "", meta.album, flags=re.I).strip()
     alb_comp = compact_alnum(sp_album_clean)
-    if (
-        alb_comp
-        and len(alb_comp) >= 4
-        and sp_album_clean.lower() not in ("single", "spotify playlist")
-    ):
+    if alb_comp and len(alb_comp) >= 4 and sp_album_clean.lower() not in ("single", "spotify playlist"):
         if alb_comp in cand_comp or (track_comp and alb_comp in track_comp):
             return True
 
-    if has_cjk_chars(meta.title) and is_trusted_artist_or_remixer_channel(
-        uploader, meta
-    ):
+    if has_cjk_chars(meta.title) and is_trusted_artist_or_remixer_channel(uploader, meta):
         return True
 
     first_desc_lines = "\n".join(description.splitlines()[:4]).lower()
-    if (
-        target_comp
-        and len(target_comp) >= 4
-        and target_comp in compact_alnum(first_desc_lines)
-    ):
+    if target_comp and len(target_comp) >= 4 and target_comp in compact_alnum(first_desc_lines):
         return True
 
     target_words = normalize_tokens(target_base)
@@ -3434,25 +2767,18 @@ def is_perfect_match(entry: dict[str, Any], meta: TrackMeta) -> tuple[bool, str]
     cand_title = entry.get("title") or ""
     cand_title_lower = cand_title.lower()
     entry_album = (entry.get("album") or "").lower()
-    entry_year = str(
-        entry.get("release_year") or entry.get("upload_date", "")[:4] or ""
-    )
+    entry_year = str(entry.get("release_year") or entry.get("upload_date", "")[:4] or "")
     uploader = entry.get("uploader") or entry.get("channel") or ""
     uploader_lower = uploader.lower()
     description = (entry.get("description") or "").lower()
 
-    ver_ok, ver_reason = check_version_compatibility(
-        cand_title, uploader, description, meta
-    )
+    ver_ok, ver_reason = check_version_compatibility(cand_title, uploader, description, meta)
     if not ver_ok:
         return False, ver_reason
     if not has_title_match(entry, meta):
         return False, "название не совпадает с искомым треком"
 
-    has_provided = (
-        "provided to youtube by" in description
-        or "auto-generated by youtube" in description
-    )
+    has_provided = "provided to youtube by" in description or "auto-generated by youtube" in description
     is_topic = uploader_lower.endswith("- topic") or "release - topic" in uploader_lower
     is_artist_ch = is_trusted_artist_or_remixer_channel(uploader, meta)
     has_cid_card = has_content_id_music_match(entry, meta)
@@ -3462,14 +2788,10 @@ def is_perfect_match(entry: dict[str, Any], meta: TrackMeta) -> tuple[bool, str]
 
     meta_album_lower = meta.album.lower().strip()
     album_matched = meta_album_lower not in ("", "single", "spotify playlist") and (
-        meta_album_lower in entry_album
-        or meta_album_lower in description
-        or meta_album_lower in cand_title_lower
+        meta_album_lower in entry_album or meta_album_lower in description or meta_album_lower in cand_title_lower
     )
     year_matched = meta.release_year != "N/A" and (
-        meta.release_year == entry_year
-        or meta.release_year in description
-        or meta.release_year in cand_title_lower
+        meta.release_year == entry_year or meta.release_year in description or meta.release_year in cand_title_lower
     )
 
     details = [f"dur_diff: {format_duration(dur_diff)}"]
@@ -3489,9 +2811,7 @@ def is_perfect_match(entry: dict[str, Any], meta: TrackMeta) -> tuple[bool, str]
     return True, ", ".join(details)
 
 
-def score_candidate(
-    entry: dict[str, Any], meta: TrackMeta, source_type: str
-) -> tuple[float, str]:
+def score_candidate(entry: dict[str, Any], meta: TrackMeta, source_type: str) -> tuple[float, str]:
     if not entry:
         return -1.0, "пустой ответ"
     if entry.get("drm"):
@@ -3505,26 +2825,18 @@ def score_candidate(
     dur_diff = abs(duration - meta.duration_sec)
     title_lower = cand_title.lower()
 
-    ver_ok, ver_reason = check_version_compatibility(
-        cand_title, uploader, description, meta
-    )
+    ver_ok, ver_reason = check_version_compatibility(cand_title, uploader, description, meta)
     if not ver_ok:
         return -1.0, ver_reason
     if 0 < duration < 30 and meta.duration_sec > 30:
-        return (
-            -1.0,
-            f"длительность {format_duration(duration)} слишком мала (тизер/шортс)",
-        )
+        return -1.0, f"длительность {format_duration(duration)} слишком мала (тизер/шортс)"
     if meta.duration_sec > 0 and dur_diff > 8:
         return -1.0, (
             f"длина {format_duration(duration)} не равна эталону {format_duration(meta.duration_sec)} "
             f"(разница {format_duration(dur_diff)} > 8сек)"
         )
     if not has_title_match(entry, meta):
-        return (
-            -1.0,
-            f"чужое название трека ('{cand_title}' не совпадает с '{meta.clean_title}')",
-        )
+        return -1.0, f"чужое название трека ('{cand_title}' не совпадает с '{meta.clean_title}')"
 
     uploader_lower = uploader.lower()
     score = 50.0
@@ -3538,10 +2850,7 @@ def score_candidate(
         score += 15.0
         reasons.append("dur:exact(+15)")
 
-    if (
-        "provided to youtube by" in description
-        or "auto-generated by youtube" in description
-    ):
+    if "provided to youtube by" in description or "auto-generated by youtube" in description:
         score += 60.0
         reasons.append("studio_master:+60")
     if has_content_id_music_match(entry, meta):
@@ -3556,15 +2865,7 @@ def score_candidate(
 
     if any(
         sym in description
-        for sym in (
-            "℗",
-            "©",
-            "phonographic copyright",
-            "sony music",
-            "universal music",
-            "warner music",
-            "первое музыкальное",
-        )
+        for sym in ("℗", "©", "phonographic copyright", "sony music", "universal music", "warner music", "первое музыкальное")
     ):
         score += 20.0
         reasons.append("label_copyright:+20")
@@ -3576,28 +2877,15 @@ def score_candidate(
         score += 25.0
         reasons.append("album_match:+25")
 
-    if meta.release_year != "N/A" and (
-        meta.release_year in description or meta.release_year in title_lower
-    ):
+    if meta.release_year != "N/A" and (meta.release_year in description or meta.release_year in title_lower):
         score += 15.0
         reasons.append(f"year_match({meta.release_year}):+15")
 
-    if any(
-        k in title_lower
-        for k in (
-            "official audio",
-            "official video",
-            "official music video",
-            "official lyric video",
-        )
-    ):
+    if any(k in title_lower for k in ("official audio", "official video", "official music video", "official lyric video")):
         score += 25.0
         reasons.append("official_tag:+25")
 
-    if any(
-        artists_loosely_match(a, title_lower) or a.lower() in description[:250]
-        for a in meta.artists_all
-    ):
+    if any(artists_loosely_match(a, title_lower) or a.lower() in description[:250] for a in meta.artists_all):
         score += 15.0
         reasons.append("artist_mentioned:+15")
 
@@ -3608,9 +2896,7 @@ def score_candidate(
     return score, ", ".join(reasons)
 
 
-def build_ydl_opts(
-    attempt_idx: int, isolated_cookie_path: Path | None, for_search: bool = False
-) -> dict[str, Any]:
+def build_ydl_opts(attempt_idx: int, isolated_cookie_path: Path | None, for_search: bool = False) -> dict[str, Any]:
     profile_cfg = YT_CLIENT_PROFILES[attempt_idx % len(YT_CLIENT_PROFILES)]
     extractor_args: dict[str, Any] = {
         "youtube": {"player_client": profile_cfg["clients"]},
@@ -3683,9 +2969,7 @@ def make_progress_hooks(
                 return
             if not started_logged:
                 started_logged = True
-                logger.info(
-                    f"[{source_label}] Начато скачивание аудио ({format_bytes(total) if total > 0 else 'поток'})..."
-                )
+                logger.info(f"[{source_label}] Начато скачивание аудио ({format_bytes(total) if total > 0 else 'поток'})...")
             if total > 0:
                 pct = int((downloaded / total) * 100)
                 milestone = (pct // 25) * 25
@@ -3710,12 +2994,7 @@ def make_progress_hooks(
         nonlocal pp_logged
         if watchdog:
             watchdog.enter_ffmpeg()
-        if (
-            LOG_DOWNLOAD_PROGRESS
-            and not is_shutting_down()
-            and d.get("status") == "started"
-            and not pp_logged
-        ):
+        if LOG_DOWNLOAD_PROGRESS and not is_shutting_down() and d.get("status") == "started" and not pp_logged:
             pp_logged = True
             logger.info(
                 f"[FFMPEG] Мастеринг в MP3 320kbps (44.1kHz, обрезка тишины: {yn(AUDIO_TRIM_SILENCE)}, "
@@ -3773,9 +3052,7 @@ def skip_if_already_downloaded_from_same_url(
     try:
         tag_mp3_file(existing_mp3_path, meta)
     except Exception as e:
-        logger.debug(
-            f"Не удалось обновить теги существующего файла {existing_mp3_path.name}: {e}"
-        )
+        logger.debug(f"Не удалось обновить теги существующего файла {existing_mp3_path.name}: {e}")
 
     with cache_lock:
         cache_data["tracks"][meta.spotify_id] = {
@@ -3806,9 +3083,7 @@ def download_with_retries(
 ) -> tuple[Path | None, str]:
     ffmpeg_args = build_ffmpeg_postprocessor_args()
     src_tag = source_type.upper()
-    has_cookie = bool(
-        (isolated_cookie and isolated_cookie.exists()) or YT_COOKIE_FILE.exists()
-    )
+    has_cookie = bool((isolated_cookie and isolated_cookie.exists()) or YT_COOKIE_FILE.exists())
     last_error = ""
 
     for attempt in range(YTDLP_RETRIES):
@@ -3818,32 +3093,20 @@ def download_with_retries(
 
         profile_cfg = YT_CLIENT_PROFILES[attempt % len(YT_CLIENT_PROFILES)]
         use_c = profile_cfg.get("use_cookies", True) and has_cookie
-        profile_name = "+".join(profile_cfg["clients"]) + (
-            " [cookies:Да]" if use_c else " [cookies:Нет]"
-        )
+        profile_name = "+".join(profile_cfg["clients"]) + (" [cookies:Да]" if use_c else " [cookies:Нет]")
 
-        logger.info(
-            f"[КАЧАЕМ | {src_tag}] Попытка {attempt + 1}/{YTDLP_RETRIES} (клиент: {profile_name}) -> {url}"
-        )
+        logger.info(f"[КАЧАЕМ | {src_tag}] Попытка {attempt + 1}/{YTDLP_RETRIES} (клиент: {profile_name}) -> {url}")
 
         dl_hook, pp_hook = make_progress_hooks(src_tag, watchdog=watchdog)
         dl_opts = build_ydl_opts(attempt, isolated_cookie, for_search=False)
-        dl_opts.update(
-            {
-                "format": "bestaudio/best",
-                "outtmpl": f"{staging_base}.%(ext)s",
-                "progress_hooks": [dl_hook],
-                "postprocessor_hooks": [pp_hook],
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "320",
-                    }
-                ],
-                "postprocessor_args": {"extractaudio": ffmpeg_args},
-            }
-        )
+        dl_opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": f"{staging_base}.%(ext)s",
+            "progress_hooks": [dl_hook],
+            "postprocessor_hooks": [pp_hook],
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "320"}],
+            "postprocessor_args": {"extractaudio": ffmpeg_args},
+        })
 
         try:
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
@@ -3853,14 +3116,9 @@ def download_with_retries(
                 if source_type == "soundcloud":
                     reset_soundcloud_403()
                 if meta_to_enrich and info:
-                    if meta_to_enrich.title.startswith(
-                        ("Custom Track #", "External Track")
-                    ) and info.get("title"):
+                    if meta_to_enrich.title.startswith(("Custom Track #", "External Track")) and info.get("title"):
                         meta_to_enrich.title = info["title"]
-                    if meta_to_enrich.artist in (
-                        "Custom Artist",
-                        "External Artist",
-                    ) and (
+                    if meta_to_enrich.artist in ("Custom Artist", "External Artist") and (
                         extracted_artist := (info.get("artist") or info.get("uploader"))
                     ):
                         meta_to_enrich.artist = extracted_artist
@@ -3899,18 +3157,12 @@ def download_with_retries(
         except TimeoutError:
             raise
         except Exception as e:
-            if is_shutting_down() or (
-                watchdog and (watchdog.aborted_by_watchdog or watchdog.hard_cancelled)
-            ):
-                raise TimeoutError(
-                    (watchdog.abort_reason if watchdog else "") or str(e)
-                ) from e
+            if is_shutting_down() or (watchdog and (watchdog.aborted_by_watchdog or watchdog.hard_cancelled)):
+                raise TimeoutError((watchdog.abort_reason if watchdog else "") or str(e)) from e
             err_str = str(e)
             last_error = err_str
             if "DRM protected" in err_str:
-                logger.info(
-                    f"[{src_tag}] Источник {url} защищен DRM, переключаемся на следующий вариант."
-                )
+                logger.info(f"[{src_tag}] Источник {url} защищен DRM, переключаемся на следующий вариант.")
                 return None, "Защищен DRM (невозможно скачать)"
             if any(
                 unavail in err_str
@@ -3923,26 +3175,15 @@ def download_with_retries(
                 )
             ):
                 if attempt == 0 and has_cookie and not use_c and YTDLP_RETRIES > 1:
-                    logger.info(
-                        f"[{src_tag}] Видео недоступно без авторизации, мгновенно пробуем профиль с куками..."
-                    )
+                    logger.info(f"[{src_tag}] Видео недоступно без авторизации, мгновенно пробуем профиль с куками...")
                     continue
-                logger.warning(
-                    f"[{src_tag}] Видео {url} недоступно для IP сервера (Geo-Block / Удалено) — пропускаем без ожидания."
-                )
+                logger.warning(f"[{src_tag}] Видео {url} недоступно для IP сервера (Geo-Block / Удалено) — пропускаем без ожидания.")
                 return None, err_str
             if "Sign in to confirm your age" in err_str and not use_c:
-                logger.info(
-                    f"[{src_tag}] Ролик 18+ (Age-Gate), мгновенно переключаемся на профиль с куками..."
-                )
+                logger.info(f"[{src_tag}] Ролик 18+ (Age-Gate), мгновенно переключаемся на профиль с куками...")
                 continue
-            if (
-                "Requested format is not available" in err_str
-                and attempt + 1 < YTDLP_RETRIES
-            ):
-                logger.info(
-                    f"[{src_tag}] Клиент {profile_name} не отдал аудиопоток, мгновенно пробуем следующий профиль..."
-                )
+            if "Requested format is not available" in err_str and attempt + 1 < YTDLP_RETRIES:
+                logger.info(f"[{src_tag}] Клиент {profile_name} не отдал аудиопоток, мгновенно пробуем следующий профиль...")
                 continue
             wait_sec = float(2**attempt)
             logger.warning(
@@ -4014,9 +3255,7 @@ def process_track_sync(
 
     token_ctx = current_ctx.set(worker_label)
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
-    temp_work_dir = Path(
-        tempfile.mkdtemp(dir=STAGING_DIR, prefix=f"sp_{meta.safe_id}_")
-    )
+    temp_work_dir = Path(tempfile.mkdtemp(dir=STAGING_DIR, prefix=f"sp_{meta.safe_id}_"))
     isolated_cookie: Path | None = None
 
     show_scoring = LOG_SHOW_SCORING or logger.isEnabledFor(logging.DEBUG)
@@ -4032,12 +3271,8 @@ def process_track_sync(
 
         existing_mp3_path = OUTPUT_DIR / meta.id_filename
         existing_disk_url = str(cached_entry.get("source_url") or "").strip()
-        existing_disk_src_type = str(
-            cached_entry.get("source_type") or "cached"
-        ).strip()
-        has_valid_existing_mp3 = (
-            existing_mp3_path.exists() and existing_mp3_path.stat().st_size > 50_000
-        )
+        existing_disk_src_type = str(cached_entry.get("source_type") or "cached").strip()
+        has_valid_existing_mp3 = existing_mp3_path.exists() and existing_mp3_path.stat().st_size > 50_000
         failed_url_keys: set[str] = set()
 
         logger.info(
@@ -4047,39 +3282,17 @@ def process_track_sync(
 
         if meta.direct_url:
             if skip_if_already_downloaded_from_same_url(
-                meta.direct_url,
-                existing_mp3_path,
-                existing_disk_url,
-                meta,
-                "spotitracks",
-                100,
-                cache_data,
-                quarantine,
+                meta.direct_url, existing_mp3_path, existing_disk_url, meta, "spotitracks", 100, cache_data, quarantine
             ):
                 return True, ""
 
             logger.info(f"[DIRECT URL] Задан прямой источник: {meta.direct_url}")
             staged_mp3, err_reason = download_with_retries(
-                meta.direct_url,
-                temp_work_dir / "track_audio",
-                isolated_cookie,
-                "spotitracks",
-                meta_to_enrich=meta,
-                watchdog=watchdog,
-                allow_any_duration=True,
+                meta.direct_url, temp_work_dir / "track_audio", isolated_cookie, "spotitracks",
+                meta_to_enrich=meta, watchdog=watchdog, allow_any_duration=True,
             )
             if staged_mp3:
-                finalize_staged_mp3(
-                    staged_mp3,
-                    meta,
-                    meta.direct_url,
-                    "spotitracks",
-                    100,
-                    meta.title,
-                    cache_data,
-                    quarantine,
-                    watchdog,
-                )
+                finalize_staged_mp3(staged_mp3, meta, meta.direct_url, "spotitracks", 100, meta.title, cache_data, quarantine, watchdog)
                 return True, ""
 
             if bad_key := canonical_media_url_key(meta.direct_url):
@@ -4087,15 +3300,11 @@ def process_track_sync(
 
             can_fallback_to_search = (
                 DIRECT_URL_FALLBACK
-                and meta.artist
-                not in ("", "Unknown", "Custom Artist", "External Artist")
+                and meta.artist not in ("", "Unknown", "Custom Artist", "External Artist")
                 and not meta.title.startswith(("Custom Track #", "External Track"))
             )
             if not can_fallback_to_search:
-                return (
-                    False,
-                    f"Ошибка скачивания прямой ссылки: {err_reason or 'Неизвестно'}",
-                )
+                return False, f"Ошибка скачивания прямой ссылки: {err_reason or 'Неизвестно'}"
 
             logger.warning(
                 f"[DIRECT URL FALLBACK] Прямая ссылка {meta.direct_url} недоступна ({err_reason or 'сбой'}), "
@@ -4110,51 +3319,27 @@ def process_track_sync(
         ):
             if has_valid_existing_mp3:
                 skip_if_already_downloaded_from_same_url(
-                    existing_disk_url,
-                    existing_mp3_path,
-                    existing_disk_url,
-                    meta,
-                    existing_disk_src_type,
-                    float(cached_entry.get("score", 100)),
-                    cache_data,
-                    quarantine,
+                    existing_disk_url, existing_mp3_path, existing_disk_url, meta,
+                    existing_disk_src_type, float(cached_entry.get("score", 100)), cache_data, quarantine,
                 )
                 return True, ""
 
-            logger.info(
-                f"[CACHE URL] Найдена прямая ссылка в кэше ({existing_disk_url}), качаем без поиска..."
-            )
+            logger.info(f"[CACHE URL] Найдена прямая ссылка в кэше ({existing_disk_url}), качаем без поиска...")
             staged_mp3, _ = download_with_retries(
-                existing_disk_url,
-                temp_work_dir / "track_audio",
-                isolated_cookie,
-                existing_disk_src_type,
-                meta_to_enrich=meta,
-                watchdog=watchdog,
+                existing_disk_url, temp_work_dir / "track_audio", isolated_cookie, existing_disk_src_type, meta_to_enrich=meta, watchdog=watchdog
             )
             if staged_mp3:
                 finalize_staged_mp3(
-                    staged_mp3,
-                    meta,
-                    existing_disk_url,
-                    existing_disk_src_type,
-                    cached_entry.get("score", 100),
-                    meta.title,
-                    cache_data,
-                    quarantine,
-                    watchdog,
+                    staged_mp3, meta, existing_disk_url, existing_disk_src_type, cached_entry.get("score", 100),
+                    meta.title, cache_data, quarantine, watchdog,
                 )
                 return True, ""
             if bad_key := canonical_media_url_key(existing_disk_url):
                 failed_url_keys.add(bad_key)
-            logger.warning(
-                "Ссылка из кэша недоступна, переходим к каскадному поиску..."
-            )
+            logger.warning("Ссылка из кэша недоступна, переходим к каскадному поиску...")
 
         if meta.isrc:
-            logger.info(
-                f"[УРОВЕНЬ 1 | ISRC] Поиск по студийному коду ISRC: {meta.isrc}"
-            )
+            logger.info(f"[УРОВЕНЬ 1 | ISRC] Поиск по студийному коду ISRC: {meta.isrc}")
             for attempt in range(YTDLP_RETRIES):
                 watchdog.reset_for_search_stage(f"search:ISRC:try#{attempt + 1}")
                 try:
@@ -4163,54 +3348,26 @@ def process_track_sync(
                     with yt_dlp.YoutubeDL(s_opts) as ydl:
                         if attempt > 0:
                             ydl.cache.remove()
-                        info = ydl.extract_info(
-                            f'ytsearch5:"{meta.isrc}"', download=False
-                        )
-                        entries = [
-                            e for e in (info.get("entries", []) if info else []) if e
-                        ]
+                        info = ydl.extract_info(f'ytsearch5:"{meta.isrc}"', download=False)
+                        entries = [e for e in (info.get("entries", []) if info else []) if e]
                         for entry in entries:
                             w_url = entry.get("webpage_url")
-                            if (
-                                not w_url
-                                or canonical_media_url_key(w_url) in failed_url_keys
-                            ):
+                            if not w_url or canonical_media_url_key(w_url) in failed_url_keys:
                                 continue
                             ok_match, match_details = is_perfect_match(entry, meta)
                             if ok_match:
-                                logger.info(
-                                    f"★ Идеальное совпадение по ISRC ({match_details}): '{entry.get('title')}' ({w_url})"
-                                )
+                                logger.info(f"★ Идеальное совпадение по ISRC ({match_details}): '{entry.get('title')}' ({w_url})")
                                 if skip_if_already_downloaded_from_same_url(
-                                    w_url,
-                                    existing_mp3_path,
-                                    existing_disk_url,
-                                    meta,
-                                    "ytmusic",
-                                    100,
-                                    cache_data,
-                                    quarantine,
+                                    w_url, existing_mp3_path, existing_disk_url, meta, "ytmusic", 100, cache_data, quarantine
                                 ):
                                     return True, ""
                                 staged_mp3, _ = download_with_retries(
-                                    w_url,
-                                    temp_work_dir / "track_audio",
-                                    isolated_cookie,
-                                    "ytmusic",
-                                    meta_to_enrich=meta,
-                                    watchdog=watchdog,
+                                    w_url, temp_work_dir / "track_audio", isolated_cookie, "ytmusic", meta_to_enrich=meta, watchdog=watchdog
                                 )
                                 if staged_mp3:
                                     finalize_staged_mp3(
-                                        staged_mp3,
-                                        meta,
-                                        w_url,
-                                        "ytmusic",
-                                        100,
-                                        entry.get("title", meta.title),
-                                        cache_data,
-                                        quarantine,
-                                        watchdog,
+                                        staged_mp3, meta, w_url, "ytmusic", 100,
+                                        entry.get("title", meta.title), cache_data, quarantine, watchdog,
                                     )
                                     return True, ""
                                 if bad_key := canonical_media_url_key(w_url):
@@ -4222,9 +3379,7 @@ def process_track_sync(
                 except Exception as e:
                     logger.debug(f"Ошибка ISRC поиска: {e}")
 
-        logger.info(
-            f"[УРОВЕНЬ 2 | TOPIC / YTM] Поиск студийного релиза: {meta.artist} - {meta.clean_title}"
-        )
+        logger.info(f"[УРОВЕНЬ 2 | TOPIC / YTM] Поиск студийного релиза: {meta.artist} - {meta.clean_title}")
         topic_entries: list[dict[str, Any]] = []
         for attempt in range(YTDLP_RETRIES):
             watchdog.reset_for_search_stage(f"search:TOPIC:try#{attempt + 1}")
@@ -4234,13 +3389,8 @@ def process_track_sync(
                 with yt_dlp.YoutubeDL(s_opts) as ydl:
                     if attempt > 0:
                         ydl.cache.remove()
-                    info = ydl.extract_info(
-                        f"ytsearch5:{meta.artist} - {meta.clean_title} topic",
-                        download=False,
-                    )
-                    topic_entries = [
-                        e for e in (info.get("entries", []) if info else []) if e
-                    ]
+                    info = ydl.extract_info(f"ytsearch5:{meta.artist} - {meta.clean_title} topic", download=False)
+                    topic_entries = [e for e in (info.get("entries", []) if info else []) if e]
                 if topic_entries:
                     break
             except TimeoutError:
@@ -4259,70 +3409,30 @@ def process_track_sync(
                     f"'{entry.get('title')}' (Канал: {entry.get('uploader') or entry.get('channel')} | {w_url})"
                 )
                 if skip_if_already_downloaded_from_same_url(
-                    w_url,
-                    existing_mp3_path,
-                    existing_disk_url,
-                    meta,
-                    "ytmusic",
-                    100,
-                    cache_data,
-                    quarantine,
+                    w_url, existing_mp3_path, existing_disk_url, meta, "ytmusic", 100, cache_data, quarantine
                 ):
                     return True, ""
                 staged_mp3, _ = download_with_retries(
-                    w_url,
-                    temp_work_dir / "track_audio",
-                    isolated_cookie,
-                    "ytmusic",
-                    meta_to_enrich=meta,
-                    watchdog=watchdog,
+                    w_url, temp_work_dir / "track_audio", isolated_cookie, "ytmusic", meta_to_enrich=meta, watchdog=watchdog
                 )
                 if staged_mp3:
                     finalize_staged_mp3(
-                        staged_mp3,
-                        meta,
-                        w_url,
-                        "ytmusic",
-                        100,
-                        entry.get("title", meta.title),
-                        cache_data,
-                        quarantine,
-                        watchdog,
+                        staged_mp3, meta, w_url, "ytmusic", 100,
+                        entry.get("title", meta.title), cache_data, quarantine, watchdog,
                     )
                     return True, ""
                 if bad_key := canonical_media_url_key(w_url):
                     failed_url_keys.add(bad_key)
 
-        logger.info(
-            "[УРОВЕНЬ 3 | КАСКАД] Идеальных Topic-совпадений не найдено, запускаем балльный каскад (YouTube / SoundCloud)..."
-        )
+        logger.info("[УРОВЕНЬ 3 | КАСКАД] Идеальных Topic-совпадений не найдено, запускаем балльный каскад (YouTube / SoundCloud)...")
         all_artists_str = ", ".join(meta.artists_all[:2])
         search_waterfall: list[tuple[str, str, str]] = [
-            (
-                "youtube",
-                f"ytsearch5:{all_artists_str} - {meta.clean_title} Official Audio",
-                "Поиск Official Audio на YouTube",
-            ),
-            (
-                "soundcloud",
-                f"scsearch5:{meta.artist} - {meta.clean_title}",
-                "Поиск на SoundCloud",
-            ),
-            (
-                "youtube",
-                f"ytsearch5:{meta.artist} {meta.clean_title}",
-                "Широкий поиск на YouTube",
-            ),
+            ("youtube", f"ytsearch5:{all_artists_str} - {meta.clean_title} Official Audio", "Поиск Official Audio на YouTube"),
+            ("soundcloud", f"scsearch5:{meta.artist} - {meta.clean_title}", "Поиск на SoundCloud"),
+            ("youtube", f"ytsearch5:{meta.artist} {meta.clean_title}", "Широкий поиск на YouTube"),
             *(
-                [
-                    (
-                        "youtube",
-                        f"ytsearch5:{meta.artist} {meta.album}",
-                        "Поиск по названию альбома (CJK Fallback)",
-                    )
-                ]
-                if has_cjk_chars(meta.title)
-                and meta.album.lower() not in ("single", "spotify playlist")
+                [("youtube", f"ytsearch5:{meta.artist} {meta.album}", "Поиск по названию альбома (CJK Fallback)")]
+                if has_cjk_chars(meta.title) and meta.album.lower() not in ("single", "spotify playlist")
                 else []
             ),
         ]
@@ -4333,33 +3443,23 @@ def process_track_sync(
         for step_idx, (source_type, query, step_desc) in enumerate(search_waterfall, 1):
             watchdog.reset_for_search_stage(f"search:cascade_{step_idx}_{source_type}")
             if source_type == "soundcloud" and is_soundcloud_blocked():
-                logger.info(
-                    f"[КАСКАД {step_idx}/{total_steps} | SOUNDCLOUD] Пропуск (IP VPN заблокирован 403 в SoundCloud)"
-                )
+                logger.info(f"[КАСКАД {step_idx}/{total_steps} | SOUNDCLOUD] Пропуск (IP VPN заблокирован 403 в SoundCloud)")
                 continue
 
-            logger.info(
-                f"[КАСКАД {step_idx}/{total_steps} | {source_type.upper()}] {step_desc} -> '{query}'"
-            )
+            logger.info(f"[КАСКАД {step_idx}/{total_steps} | {source_type.upper()}] {step_desc} -> '{query}'")
             entries: list[dict[str, Any]] = []
             for search_attempt in range(YTDLP_RETRIES):
-                watchdog.reset_for_search_stage(
-                    f"search:cascade_{step_idx}_{source_type}:try#{search_attempt + 1}"
-                )
+                watchdog.reset_for_search_stage(f"search:cascade_{step_idx}_{source_type}:try#{search_attempt + 1}")
                 if source_type == "soundcloud" and is_soundcloud_blocked():
                     break
                 try:
-                    s_opts = build_ydl_opts(
-                        search_attempt, isolated_cookie, for_search=True
-                    )
+                    s_opts = build_ydl_opts(search_attempt, isolated_cookie, for_search=True)
                     s_opts.update({"extract_flat": False, "ignoreerrors": True})
                     with yt_dlp.YoutubeDL(s_opts) as ydl:
                         if search_attempt > 0:
                             ydl.cache.remove()
                         info = ydl.extract_info(query, download=False)
-                        entries = [
-                            e for e in (info.get("entries", []) if info else []) if e
-                        ]
+                        entries = [e for e in (info.get("entries", []) if info else []) if e]
                     if entries:
                         if source_type == "soundcloud":
                             reset_soundcloud_403()
@@ -4372,9 +3472,7 @@ def process_track_sync(
             if not entries and not (step_idx == 1 and topic_entries):
                 continue
 
-            combined_entries = entries + (
-                topic_entries if step_idx == 1 and source_type == "youtube" else []
-            )
+            combined_entries = entries + (topic_entries if step_idx == 1 and source_type == "youtube" else [])
             seen_urls: set[str] = set()
             scored: list[tuple[float, str, str, str]] = []
 
@@ -4386,9 +3484,7 @@ def process_track_sync(
                 seen_urls.add(w_key)
                 if w_key in failed_url_keys:
                     if show_scoring:
-                        score_log_fn(
-                            f"  ✗ Пропуск: '{entry.get('title') or 'Unknown'}' [{w_url}] -> этот URL уже проверялся и недоступен"
-                        )
+                        score_log_fn(f"  ✗ Пропуск: '{entry.get('title') or 'Unknown'}' [{w_url}] -> этот URL уже проверялся и недоступен")
                     continue
 
                 s, reason = score_candidate(entry, meta, source_type)
@@ -4398,55 +3494,25 @@ def process_track_sync(
                 if s > 0:
                     scored.append((s, w_url, c_title, c_up))
                     if show_scoring:
-                        score_log_fn(
-                            f"  ✓ Кандидат: '{c_title}' [{c_up} | {c_dur_str} | {w_url}] -> {s:.0f} pts ({reason})"
-                        )
+                        score_log_fn(f"  ✓ Кандидат: '{c_title}' [{c_up} | {c_dur_str} | {w_url}] -> {s:.0f} pts ({reason})")
                 elif show_scoring:
-                    score_log_fn(
-                        f"  ✗ Отклонен: '{c_title}' [{c_up} | {c_dur_str}] -> {reason}"
-                    )
+                    score_log_fn(f"  ✗ Отклонен: '{c_title}' [{c_up} | {c_dur_str}] -> {reason}")
 
             if not scored:
                 continue
 
             scored.sort(key=lambda x: x[0], reverse=True)
-            for cand_rank, (score, candidate_url, c_title, c_up) in enumerate(
-                scored[:2], 1
-            ):
-                logger.info(
-                    f"★ Выбран лучший источник #{cand_rank} [{source_type.upper()} | {int(score)} pts]: '{c_title}' (Канал: {c_up} | {candidate_url})"
-                )
+            for cand_rank, (score, candidate_url, c_title, c_up) in enumerate(scored[:2], 1):
+                logger.info(f"★ Выбран лучший источник #{cand_rank} [{source_type.upper()} | {int(score)} pts]: '{c_title}' (Канал: {c_up} | {candidate_url})")
                 if skip_if_already_downloaded_from_same_url(
-                    candidate_url,
-                    existing_mp3_path,
-                    existing_disk_url,
-                    meta,
-                    source_type,
-                    score,
-                    cache_data,
-                    quarantine,
+                    candidate_url, existing_mp3_path, existing_disk_url, meta, source_type, score, cache_data, quarantine
                 ):
                     return True, ""
                 staged_mp3, err_reason = download_with_retries(
-                    candidate_url,
-                    temp_work_dir / "track_audio",
-                    isolated_cookie,
-                    source_type,
-                    meta_to_enrich=meta,
-                    watchdog=watchdog,
+                    candidate_url, temp_work_dir / "track_audio", isolated_cookie, source_type, meta_to_enrich=meta, watchdog=watchdog
                 )
                 if staged_mp3:
-                    finalize_staged_mp3(
-                        staged_mp3,
-                        meta,
-                        candidate_url,
-                        source_type,
-                        score,
-                        c_title,
-                        cache_data,
-                        quarantine,
-                        watchdog,
-                    )
+                    finalize_staged_mp3(staged_mp3, meta, candidate_url, source_type, score, c_title, cache_data, quarantine, watchdog)
                     return True, ""
                 if bad_key := canonical_media_url_key(candidate_url):
                     failed_url_keys.add(bad_key)
@@ -4457,9 +3523,7 @@ def process_track_sync(
                 f"[УРОВЕНЬ 4 | ФОЛЛБЭК ОТКЛЮЧЕН] ENABLE_FALLBACK_SEARCH=false — "
                 f"пропускаем нестрогий поиск для '{meta.display_name}'."
             )
-            logger.error(
-                f"✖ Не удалось найти/скачать ни на одной площадке: {meta.display_name} ({meta.id_filename})"
-            )
+            logger.error(f"✖ Не удалось найти/скачать ни на одной площадке: {meta.display_name} ({meta.id_filename})")
             return False, last_download_error
 
         full_unmodified_query = f"{meta.artist} - {meta.title}"
@@ -4469,23 +3533,15 @@ def process_track_sync(
         )
         fallback_entries: list[dict[str, Any]] = []
         for fb_attempt in range(YTDLP_RETRIES):
-            watchdog.reset_for_search_stage(
-                f"search:FALLBACK_FIRST_YT:try#{fb_attempt + 1}"
-            )
+            watchdog.reset_for_search_stage(f"search:FALLBACK_FIRST_YT:try#{fb_attempt + 1}")
             try:
                 s_opts = build_ydl_opts(fb_attempt, isolated_cookie, for_search=True)
                 s_opts.update({"extract_flat": False, "ignoreerrors": True})
                 with yt_dlp.YoutubeDL(s_opts) as ydl:
                     if fb_attempt > 0:
                         ydl.cache.remove()
-                    info = ydl.extract_info(
-                        f"ytsearch3:{full_unmodified_query}", download=False
-                    )
-                    fallback_entries = [
-                        e
-                        for e in (info.get("entries", []) if info else [])
-                        if e and not e.get("drm")
-                    ]
+                    info = ydl.extract_info(f"ytsearch3:{full_unmodified_query}", download=False)
+                    fallback_entries = [e for e in (info.get("entries", []) if info else []) if e and not e.get("drm")]
                 if fallback_entries:
                     break
             except TimeoutError:
@@ -4497,13 +3553,7 @@ def process_track_sync(
             fb_url = fb_entry.get("webpage_url")
             fb_dur = int(fb_entry.get("duration") or 0)
             fb_key = canonical_media_url_key(fb_url)
-            if (
-                not fb_url
-                or not fb_key
-                or fb_key in failed_url_keys
-                or (0 < fb_dur < 15)
-                or fb_dur > 1500
-            ):
+            if not fb_url or not fb_key or fb_key in failed_url_keys or (0 < fb_dur < 15) or fb_dur > 1500:
                 continue
 
             fb_title = fb_entry.get("title") or meta.title
@@ -4513,50 +3563,24 @@ def process_track_sync(
                 f"'{fb_title}' [Канал: {fb_up} | Длина: {format_duration(fb_dur)} | {fb_url}]"
             )
             if skip_if_already_downloaded_from_same_url(
-                fb_url,
-                existing_mp3_path,
-                existing_disk_url,
-                meta,
-                "youtube_fallback",
-                10,
-                cache_data,
-                quarantine,
+                fb_url, existing_mp3_path, existing_disk_url, meta, "youtube_fallback", 10, cache_data, quarantine
             ):
                 return True, ""
             staged_mp3, err_reason = download_with_retries(
-                fb_url,
-                temp_work_dir / "track_audio",
-                isolated_cookie,
-                "youtube_fallback",
-                meta_to_enrich=meta,
-                watchdog=watchdog,
-                allow_any_duration=True,
+                fb_url, temp_work_dir / "track_audio", isolated_cookie, "youtube_fallback",
+                meta_to_enrich=meta, watchdog=watchdog, allow_any_duration=True,
             )
             if staged_mp3:
-                finalize_staged_mp3(
-                    staged_mp3,
-                    meta,
-                    fb_url,
-                    "youtube_fallback",
-                    10,
-                    fb_title,
-                    cache_data,
-                    quarantine,
-                    watchdog,
-                )
+                finalize_staged_mp3(staged_mp3, meta, fb_url, "youtube_fallback", 10, fb_title, cache_data, quarantine, watchdog)
                 return True, ""
             failed_url_keys.add(fb_key)
             last_download_error = f"Ошибка скачивания первого видео фоллбэка: {err_reason or 'Неизвестно'}"
 
-        logger.error(
-            f"✖ Не удалось найти/скачать ни на одной площадке: {meta.display_name} ({meta.id_filename})"
-        )
+        logger.error(f"✖ Не удалось найти/скачать ни на одной площадке: {meta.display_name} ({meta.id_filename})")
         return False, last_download_error
     except TimeoutError as e:
         if not is_shutting_down():
-            logger.warning(
-                f"⏱ Остановка воркера по адаптивному таймеру для {meta.display_name}: {e}"
-            )
+            logger.warning(f"⏱ Остановка воркера по адаптивному таймеру для {meta.display_name}: {e}")
         return False, str(e)
     except Exception as e:
         if not is_shutting_down():
@@ -4567,9 +3591,7 @@ def process_track_sync(
         current_ctx.reset(token_ctx)
 
 
-async def resolve_azuracast_station_id(
-    client: httpx.AsyncClient, headers: dict[str, str]
-) -> str:
+async def resolve_azuracast_station_id(client: httpx.AsyncClient, headers: dict[str, str]) -> str:
     raw_station = AZURACAST_STATION_ID.strip()
     try:
         r_st = await client.get(f"{AZURACAST_URL}/api/stations", headers=headers)
@@ -4582,10 +3604,7 @@ async def resolve_azuracast_station_id(
                 st_id = str(st.get("id") or "")
                 st_short = str(st.get("short_name") or "").strip()
                 st_name = str(st.get("name") or "").strip()
-                if raw_station == st_id or raw_low in (
-                    st_short.lower(),
-                    st_name.lower(),
-                ):
+                if raw_station == st_id or raw_low in (st_short.lower(), st_name.lower()):
                     return st_id or raw_station
     except Exception as e:
         logger.debug(f"Не удалось получить список станций /api/stations: {e}")
@@ -4599,14 +3618,10 @@ async def check_azuracast_connectivity() -> None:
         print(f" ДИАГНОСТИКА ПОДКЛЮЧЕНИЯ К AZURACAST API | {BUILD_VERSION}")
         print("=" * 88)
         print(f" • AZURACAST_URL           : {AZURACAST_URL or 'НЕ ЗАДАН'}")
-        print(
-            f" • AZURACAST_STATION_ID    : {AZURACAST_STATION_ID or 'НЕ ЗАДАН (будет показан список всех станций)'}"
-        )
+        print(f" • AZURACAST_STATION_ID    : {AZURACAST_STATION_ID or 'НЕ ЗАДАН (будет показан список всех станций)'}")
         print(f" • AZURACAST_PLAYLIST_ID   : {AZURACAST_PLAYLIST_ID or 'НЕ ЗАДАН'}")
         print(f" • AZURACAST_PLAYLIST_NAME : {AZURACAST_PLAYLIST_NAME or 'НЕ ЗАДАН'}")
-        print(
-            f" • API KEY задан           : {yn(bool(AZURACAST_API_KEY))} (длина: {len(AZURACAST_API_KEY)} симв.)"
-        )
+        print(f" • API KEY задан           : {yn(bool(AZURACAST_API_KEY))} (длина: {len(AZURACAST_API_KEY)} симв.)")
         print(f" • Статус конфигурации     : {yn(is_azuracast_configured())}")
         print("-" * 88)
 
@@ -4615,70 +3630,39 @@ async def check_azuracast_connectivity() -> None:
             print("=" * 88 + "\n")
             return
 
-        headers = {
-            "X-API-Key": AZURACAST_API_KEY,
-            "Accept": "application/json",
-            "User-Agent": "SpotiSync/7.3",
-        }
-        async with httpx.AsyncClient(
-            timeout=15.0, verify=False, follow_redirects=True
-        ) as client:
+        headers = {"X-API-Key": AZURACAST_API_KEY, "Accept": "application/json", "User-Agent": "SpotiSync/7.3"}
+        async with httpx.AsyncClient(timeout=15.0, verify=False, follow_redirects=True) as client:
             t0 = time.monotonic()
             try:
-                r_status = await client.get(
-                    f"{AZURACAST_URL}/api/status", headers=headers
-                )
+                r_status = await client.get(f"{AZURACAST_URL}/api/status", headers=headers)
                 dt = (time.monotonic() - t0) * 1000
-                print(
-                    f" 1. Пинг {AZURACAST_URL}/api/status -> HTTP {r_status.status_code} ({dt:.0f} мс)"
-                )
+                print(f" 1. Пинг {AZURACAST_URL}/api/status -> HTTP {r_status.status_code} ({dt:.0f} мс)")
                 if r_status.history:
-                    redir_chain = " -> ".join(
-                        f"{r.status_code} ({r.headers.get('location')})"
-                        for r in r_status.history
-                    )
-                    print(
-                        f"    [РЕДИРЕКТ] Запрос был перенаправлен: {redir_chain} -> {r_status.url}"
-                    )
+                    redir_chain = " -> ".join(f"{r.status_code} ({r.headers.get('location')})" for r in r_status.history)
+                    print(f"    [РЕДИРЕКТ] Запрос был перенаправлен: {redir_chain} -> {r_status.url}")
                 print(f"    Ответ сервера: {r_status.text[:250].strip()}")
             except Exception as e:
-                print(
-                    f" 1. [СБОЙ СЕТИ] Не удалось достучаться до {AZURACAST_URL}/api/status: {type(e).__name__}: {e}"
-                )
-                print(
-                    "    Проверьте: находится ли контейнер в одной Docker-сети с AzuraCast или не блокирует ли трафик VPN/файрвол!"
-                )
+                print(f" 1. [СБОЙ СЕТИ] Не удалось достучаться до {AZURACAST_URL}/api/status: {type(e).__name__}: {e}")
+                print("    Проверьте: находится ли контейнер в одной Docker-сети с AzuraCast или не блокирует ли трафик VPN/файрвол!")
                 print("=" * 88 + "\n")
                 return
 
             resolved_station_id = AZURACAST_STATION_ID
             try:
-                r_stations = await client.get(
-                    f"{AZURACAST_URL}/api/stations", headers=headers
-                )
-                print(
-                    f" 2. Список радиостанций ({AZURACAST_URL}/api/stations) -> HTTP {r_stations.status_code}"
-                )
-                if r_stations.status_code == 200 and isinstance(
-                    st_list := r_stations.json(), list
-                ):
+                r_stations = await client.get(f"{AZURACAST_URL}/api/stations", headers=headers)
+                print(f" 2. Список радиостанций ({AZURACAST_URL}/api/stations) -> HTTP {r_stations.status_code}")
+                if r_stations.status_code == 200 and isinstance(st_list := r_stations.json(), list):
                     print(f"    Найдено радиостанций: {len(st_list)} шт.")
                     for st in st_list:
                         st_id = st.get("id")
                         st_short = st.get("short_name")
                         st_name = st.get("name")
-                        print(
-                            f"      • ID: {st_id} | short_name (служебное): '{st_short}' | Название: '{st_name}'"
-                        )
-                    resolved_station_id = await resolve_azuracast_station_id(
-                        client, headers
-                    )
+                        print(f"      • ID: {st_id} | short_name (служебное): '{st_short}' | Название: '{st_name}'")
+                    resolved_station_id = await resolve_azuracast_station_id(client, headers)
                     if not resolved_station_id and len(st_list) == 1:
                         resolved_station_id = str(st_list[0].get("id") or "")
             except Exception as e:
-                print(
-                    f" 2. [ОШИБКА] Сбой при запросе списка станций: {type(e).__name__}: {e}"
-                )
+                print(f" 2. [ОШИБКА] Сбой при запросе списка станций: {type(e).__name__}: {e}")
 
             if resolved_station_id and AZURACAST_API_KEY:
                 try:
@@ -4690,20 +3674,14 @@ async def check_azuracast_connectivity() -> None:
                         f" 3. Запрос плейлистов станции '{AZURACAST_STATION_ID or resolved_station_id}' "
                         f"(Resolved ID: {resolved_station_id}) -> HTTP {r_pls.status_code}"
                     )
-                    if r_pls.status_code == 200 and isinstance(
-                        pls := r_pls.json(), list
-                    ):
+                    if r_pls.status_code == 200 and isinstance(pls := r_pls.json(), list):
                         print(f"    Найдено плейлистов: {len(pls)} шт.")
                         for p in pls:
-                            print(
-                                f"      • ID: {p.get('id')} | Имя: '{p.get('name')}' | Тип: {p.get('type')}"
-                            )
+                            print(f"      • ID: {p.get('id')} | Имя: '{p.get('name')}' | Тип: {p.get('type')}")
                     else:
                         print(f"    Ответ: {r_pls.text[:300].strip()}")
                 except Exception as e:
-                    print(
-                        f" 3. [ОШИБКА] Сбой при запросе плейлистов: {type(e).__name__}: {e}"
-                    )
+                    print(f" 3. [ОШИБКА] Сбой при запросе плейлистов: {type(e).__name__}: {e}")
         print("=" * 88 + "\n")
     finally:
         current_ctx.reset(token_ctx)
@@ -4714,9 +3692,7 @@ async def resolve_azuracast_playlist_id(
     headers: dict[str, str],
     station_id: str,
 ) -> tuple[int | None, str]:
-    target_pl_id: int | None = (
-        int(AZURACAST_PLAYLIST_ID) if AZURACAST_PLAYLIST_ID.isdigit() else None
-    )
+    target_pl_id: int | None = int(AZURACAST_PLAYLIST_ID) if AZURACAST_PLAYLIST_ID.isdigit() else None
     target_pl_name = AZURACAST_PLAYLIST_NAME
 
     url = f"{AZURACAST_URL}/api/station/{station_id}/playlists"
@@ -4726,70 +3702,44 @@ async def resolve_azuracast_playlist_id(
             if target_pl_id and int(pl.get("id", 0)) == target_pl_id:
                 target_pl_name = pl.get("name", str(target_pl_id))
                 break
-            if (
-                target_pl_name
-                and str(pl.get("name", "")).strip().lower() == target_pl_name.lower()
-            ):
+            if target_pl_name and str(pl.get("name", "")).strip().lower() == target_pl_name.lower():
                 target_pl_id = int(pl["id"])
                 break
     elif r_pls.status_code != 200:
-        logger.warning(
-            f"AzuraCast вернул HTTP {r_pls.status_code} при запросе {url}: {r_pls.text[:200]}"
-        )
+        logger.warning(f"AzuraCast вернул HTTP {r_pls.status_code} при запросе {url}: {r_pls.text[:200]}")
     return target_pl_id, (target_pl_name or str(target_pl_id or ""))
 
 
-async def unassign_tracks_from_azuracast_playlist(
-    filenames_to_remove: list[str],
-) -> None:
+async def unassign_tracks_from_azuracast_playlist(filenames_to_remove: list[str]) -> None:
     if not filenames_to_remove or not is_azuracast_configured() or is_shutting_down():
         return
     token_ctx = current_ctx.set("AZURACAST-DEL")
     try:
-        headers = {
-            "X-API-Key": AZURACAST_API_KEY,
-            "Accept": "application/json",
-            "User-Agent": "SpotiSync/7.3",
-        }
-        async with httpx.AsyncClient(
-            timeout=45.0, verify=False, follow_redirects=True
-        ) as client:
+        headers = {"X-API-Key": AZURACAST_API_KEY, "Accept": "application/json", "User-Agent": "SpotiSync/7.3"}
+        async with httpx.AsyncClient(timeout=45.0, verify=False, follow_redirects=True) as client:
             station_id = await resolve_azuracast_station_id(client, headers)
-            target_pl_id, target_pl_name = await resolve_azuracast_playlist_id(
-                client, headers, station_id
-            )
+            target_pl_id, target_pl_name = await resolve_azuracast_playlist_id(client, headers, station_id)
             if not target_pl_id:
                 return
-            r_files = await client.get(
-                f"{AZURACAST_URL}/api/station/{station_id}/files", headers=headers
-            )
-            if r_files.status_code != 200 or not isinstance(
-                station_files := r_files.json(), list
-            ):
+            r_files = await client.get(f"{AZURACAST_URL}/api/station/{station_id}/files", headers=headers)
+            if r_files.status_code != 200 or not isinstance(station_files := r_files.json(), list):
                 return
 
             remove_set = set(filenames_to_remove)
             unlink_groups: dict[tuple[int, ...], list[str]] = {}
             for f_obj in station_files:
                 rel_path = str(f_obj.get("path") or "")
-                if AZURACAST_MEDIA_SUBDIR and not rel_path.startswith(
-                    f"{AZURACAST_MEDIA_SUBDIR}/"
-                ):
+                if AZURACAST_MEDIA_SUBDIR and not rel_path.startswith(f"{AZURACAST_MEDIA_SUBDIR}/"):
                     continue
                 if Path(rel_path).name not in remove_set:
                     continue
                 current_pl_ids = {
-                    int(p["id"])
-                    if isinstance(p, dict) and p.get("id") is not None
-                    else int(p)
+                    int(p["id"]) if isinstance(p, dict) and p.get("id") is not None else int(p)
                     for p in (f_obj.get("playlists") or [])
-                    if (isinstance(p, dict) and p.get("id") is not None)
-                    or isinstance(p, int)
+                    if (isinstance(p, dict) and p.get("id") is not None) or isinstance(p, int)
                 }
                 if target_pl_id in current_pl_ids:
-                    unlink_groups.setdefault(
-                        tuple(sorted(current_pl_ids - {target_pl_id})), []
-                    ).append(rel_path)
+                    unlink_groups.setdefault(tuple(sorted(current_pl_ids - {target_pl_id})), []).append(rel_path)
 
             total_unlinked = 0
             for rem_pl_tuple, file_paths in unlink_groups.items():
@@ -4798,43 +3748,27 @@ async def unassign_tracks_from_azuracast_playlist(
                     r_batch = await client.put(
                         f"{AZURACAST_URL}/api/station/{station_id}/files/batch",
                         headers=headers,
-                        json={
-                            "do": "playlist",
-                            "playlists": list(rem_pl_tuple),
-                            "files": chunk,
-                        },
+                        json={"do": "playlist", "playlists": list(rem_pl_tuple), "files": chunk},
                     )
                     if r_batch.status_code in (200, 204):
                         total_unlinked += len(chunk)
             if total_unlinked > 0:
-                logger.info(
-                    f"Убрано {total_unlinked} треков из плейлиста AzuraCast '{target_pl_name}' (ID: {target_pl_id})."
-                )
+                logger.info(f"Убрано {total_unlinked} треков из плейлиста AzuraCast '{target_pl_name}' (ID: {target_pl_id}).")
     except Exception as e:
         logger.warning(f"Ошибка при удалении треков из плейлиста AzuraCast: {e}")
     finally:
         current_ctx.reset(token_ctx)
 
 
-async def sync_with_azuracast(
-    expected_filenames: list[str], new_downloads_count: int
-) -> None:
+async def sync_with_azuracast(expected_filenames: list[str], new_downloads_count: int) -> None:
     if not is_azuracast_configured() or is_shutting_down():
         return
     token_ctx = current_ctx.set("AZURACAST")
     try:
-        headers = {
-            "X-API-Key": AZURACAST_API_KEY,
-            "Accept": "application/json",
-            "User-Agent": "SpotiSync/7.3",
-        }
-        async with httpx.AsyncClient(
-            timeout=60.0, verify=False, follow_redirects=True
-        ) as client:
+        headers = {"X-API-Key": AZURACAST_API_KEY, "Accept": "application/json", "User-Agent": "SpotiSync/7.3"}
+        async with httpx.AsyncClient(timeout=60.0, verify=False, follow_redirects=True) as client:
             station_id = await resolve_azuracast_station_id(client, headers)
-            target_pl_id, target_pl_name = await resolve_azuracast_playlist_id(
-                client, headers, station_id
-            )
+            target_pl_id, target_pl_name = await resolve_azuracast_playlist_id(client, headers, station_id)
             if not target_pl_id:
                 logger.warning("Не удалось найти целевой плейлист в AzuraCast!")
                 return
@@ -4845,15 +3779,9 @@ async def sync_with_azuracast(
             if new_downloads_count > 0:
                 await asyncio.sleep(3.0)
 
-            r_files = await client.get(
-                f"{AZURACAST_URL}/api/station/{station_id}/files", headers=headers
-            )
-            if r_files.status_code != 200 or not isinstance(
-                station_files := r_files.json(), list
-            ):
-                logger.warning(
-                    f"Ошибка получения списка файлов AzuraCast: HTTP {r_files.status_code} ({r_files.text[:200]})"
-                )
+            r_files = await client.get(f"{AZURACAST_URL}/api/station/{station_id}/files", headers=headers)
+            if r_files.status_code != 200 or not isinstance(station_files := r_files.json(), list):
+                logger.warning(f"Ошибка получения списка файлов AzuraCast: HTTP {r_files.status_code} ({r_files.text[:200]})")
                 return
 
             expected_set = set(expected_filenames)
@@ -4862,31 +3790,22 @@ async def sync_with_azuracast(
 
             for f_obj in station_files:
                 rel_path = str(f_obj.get("path") or "")
-                if AZURACAST_MEDIA_SUBDIR and not rel_path.startswith(
-                    f"{AZURACAST_MEDIA_SUBDIR}/"
-                ):
+                if AZURACAST_MEDIA_SUBDIR and not rel_path.startswith(f"{AZURACAST_MEDIA_SUBDIR}/"):
                     continue
                 if Path(rel_path).name not in expected_set:
                     continue
                 current_pl_ids = {
-                    int(p["id"])
-                    if isinstance(p, dict) and p.get("id") is not None
-                    else int(p)
+                    int(p["id"]) if isinstance(p, dict) and p.get("id") is not None else int(p)
                     for p in (f_obj.get("playlists") or [])
-                    if (isinstance(p, dict) and p.get("id") is not None)
-                    or isinstance(p, int)
+                    if (isinstance(p, dict) and p.get("id") is not None) or isinstance(p, int)
                 }
                 if target_pl_id in current_pl_ids:
                     already_assigned += 1
                 else:
-                    playlist_groups.setdefault(
-                        tuple(sorted(current_pl_ids | {target_pl_id})), []
-                    ).append(rel_path)
+                    playlist_groups.setdefault(tuple(sorted(current_pl_ids | {target_pl_id})), []).append(rel_path)
 
             if not playlist_groups:
-                logger.success(
-                    f"Все проиндексированные треки ({already_assigned} шт.) уже состоят в плейлисте AzuraCast #{target_pl_id}!"
-                )
+                logger.success(f"Все проиндексированные треки ({already_assigned} шт.) уже состоят в плейлисте AzuraCast #{target_pl_id}!")
                 return
 
             total_added = 0
@@ -4896,11 +3815,7 @@ async def sync_with_azuracast(
                     r_batch = await client.put(
                         f"{AZURACAST_URL}/api/station/{station_id}/files/batch",
                         headers=headers,
-                        json={
-                            "do": "playlist",
-                            "playlists": list(pl_tuple),
-                            "files": chunk,
-                        },
+                        json={"do": "playlist", "playlists": list(pl_tuple), "files": chunk},
                     )
                     if r_batch.status_code in (200, 204):
                         total_added += len(chunk)
@@ -4952,9 +3867,7 @@ def tag_mp3_file(file_path: Path, meta: TrackMeta) -> None:
 def print_cli_help() -> None:
     sep_main = "=" * 100
     sep_sub = "-" * 100
-    az_key_status = (
-        f"Задан ({len(AZURACAST_API_KEY)} симв.)" if AZURACAST_API_KEY else "НЕ ЗАДАН"
-    )
+    az_key_status = f"Задан ({len(AZURACAST_API_KEY)} симв.)" if AZURACAST_API_KEY else "НЕ ЗАДАН"
 
     print(
         f"\n{sep_main}\n"
@@ -4996,7 +3909,7 @@ def print_cli_help() -> None:
         f"   --track=<запрос>           Поддерживаемые форматы <запроса>:\n"
         f"                                1) Spotify ID (22 символа) или ссылка https://open.spotify.com/track/...\n"
         f"                                2) Прямая ссылка на YouTube / YouTube Music / SoundCloud\n"
-        f'                                3) Поисковая строка по имени: "Artist - Title" (или часть названия)\n'
+        f"                                3) Поисковая строка по имени: \"Artist - Title\" (или часть названия)\n"
         f"   --allow-external           Разрешить скачивание трека через --track, даже если его НЕТ в вашем\n"
         f"   --no-allow-external        плейлисте Spotify или кэше (создаст внешний трек или вытянет метаданные\n"
         f"                              из Spotify Embed + Deezer). [Сейчас: {yn(TRACK_ALLOW_EXTERNAL)}]\n\n"
@@ -5066,6 +3979,8 @@ def print_cli_help() -> None:
         f"                              если строгие уровни 1–3 ничего не нашли).\n"
         f"   --[no-]sync-delete         SYNC_DELETE_REMOVED             [{yn(SYNC_DELETE_REMOVED)}]\n"
         f"                              Удалять с диска и из AzuraCast треки, удаленные из плейлиста Spotify.\n"
+        f"   --[no-]sync-delete-ignored SYNC_DELETE_IGNORED             [{yn(SYNC_DELETE_IGNORED)}]\n"
+        f"                              Удалять с диска и из AzuraCast ранее скачанные треки, попавшие в ignores.\n"
         f"   --[no-]normalize           AUDIO_NORMALIZE                 [{yn(AUDIO_NORMALIZE)}]\n"
         f"                              Нормализация громкости FFmpeg по стандарту радиовещания (-14 LUFS).\n"
         f"   --[no-]trim-silence        AUDIO_TRIM_SILENCE              [{yn(AUDIO_TRIM_SILENCE)}]\n"
@@ -5091,9 +4006,9 @@ def print_cli_help() -> None:
         f"   3. Настроить куки YouTube (для обхода 18+ Age-Gate и защиты от ботов):\n"
         f"      docker exec -it azuracast_spotisync python /app/sync_spotify.py --auth\n\n"
         f"   4. Принудительно перекачать один трек из плейлиста по названию или ID:\n"
-        f'      docker exec -it azuracast_spotisync python /app/sync_spotify.py --track "JR Serpent - Epic Sax"\n\n'
+        f"      docker exec -it azuracast_spotisync python /app/sync_spotify.py --track \"JR Serpent - Epic Sax\"\n\n"
         f"   5. Скачать любой сторонний трек (которого нет в плейлисте) и добавить в AzuraCast:\n"
-        f'      docker exec -it azuracast_spotisync python /app/sync_spotify.py --track "https://open.spotify.com/track/2wm6XXZr3nV8trRDVQLpUI" --allow-external\n\n'
+        f"      docker exec -it azuracast_spotisync python /app/sync_spotify.py --track \"https://open.spotify.com/track/2wm6XXZr3nV8trRDVQLpUI\" --allow-external\n\n"
         f"   6. Запустить один проход синхронизации в 8 потоков с игнорированием карантина:\n"
         f"      docker exec -it azuracast_spotisync python /app/sync_spotify.py --once --ignore-quarantine --workers 8\n\n"
         f"   7. Запустить синхронизацию строго по проверенным источникам (без фоллбэка 4-го уровня):\n"
@@ -5113,9 +4028,7 @@ def print_quarantine_report(
 
     tracks_cache = cache_data.get("tracks") or {}
     print("\n" + "=" * 88)
-    print(
-        f" СПИСОК ТРЕКОВ В КАРАНТИНЕ ({len(quarantine)} шт.) | Файл: {FAILED_CACHE_FILE}"
-    )
+    print(f" СПИСОК ТРЕКОВ В КАРАНТИНЕ ({len(quarantine)} шт.) | Файл: {FAILED_CACHE_FILE}")
     print("=" * 88)
     if not quarantine:
         print(" Карантин пуст! Все треки доступны для обработки.\n" + "=" * 88 + "\n")
@@ -5153,19 +4066,12 @@ def print_custom_tracks_report() -> None:
     try:
         raw = parse_jsonc(CUSTOM_TRACKS_PATH.read_text(encoding="utf-8"))
     except Exception as e:
-        print(
-            f" [ОШИБКА] Не удалось прочитать {CUSTOM_TRACKS_PATH}: {e}\n"
-            + "=" * 88
-            + "\n"
-        )
+        print(f" [ОШИБКА] Не удалось прочитать {CUSTOM_TRACKS_PATH}: {e}\n" + "=" * 88 + "\n")
         return
 
     ignore_entries = parse_raw_ignore_entries(raw.get("ignores"))
     ignored_ids_set = {sp_id for sp_id, _ in ignore_entries}
-    print(
-        f" 0. ИГНОРИРУЕМЫЕ ТРЕКИ SPOTIFY (ignores): {len(ignore_entries)} шт.\n"
-        + "-" * 88
-    )
+    print(f" 0. ИГНОРИРУЕМЫЕ ТРЕКИ SPOTIFY (ignores): {len(ignore_entries)} шт.\n" + "-" * 88)
     if not ignore_entries:
         print("   (Нет игнорируемых треков)")
     for idx, (sp_id, reason_ign) in enumerate(ignore_entries, 1):
@@ -5181,20 +4087,13 @@ def print_custom_tracks_report() -> None:
     for k, val in (raw.get("overrides") or {}).items():
         if k.startswith("EXAMPLE_") or "EXAMPLE_ID" in k:
             continue
-        url_val = (
-            val.get("url", "").strip() if isinstance(val, dict) else str(val).strip()
-        )
+        url_val = val.get("url", "").strip() if isinstance(val, dict) else str(val).strip()
         if url_val and "EXAMPLE" not in url_val:
             sp_ov = extract_spotify_track_id(k)
             is_blocked_by_ignore = bool(sp_ov and sp_ov in ignored_ids_set)
             valid_overrides.append((k.strip(), url_val, is_blocked_by_ignore))
 
-    print(
-        "\n"
-        + "-" * 88
-        + f"\n 1. ПЕРЕОПРЕДЕЛЕНИЯ ССЫЛОК (overrides): {len(valid_overrides)} шт.\n"
-        + "-" * 88
-    )
+    print("\n" + "-" * 88 + f"\n 1. ПЕРЕОПРЕДЕЛЕНИЯ ССЫЛОК (overrides): {len(valid_overrides)} шт.\n" + "-" * 88)
     if not valid_overrides:
         print("   (Нет активных переопределений)")
     for idx, (k_str, url_str, is_blocked) in enumerate(valid_overrides, 1):
@@ -5214,26 +4113,16 @@ def print_custom_tracks_report() -> None:
         )
 
     real_custom = [
-        item
-        for item in (raw.get("custom_tracks") or [])
-        if isinstance(item, dict)
-        and item.get("url")
-        and "EXAMPLE" not in str(item.get("url"))
+        item for item in (raw.get("custom_tracks") or [])
+        if isinstance(item, dict) and item.get("url") and "EXAMPLE" not in str(item.get("url"))
     ]
-    print(
-        "\n"
-        + "-" * 88
-        + f"\n 2. КАСТОМНЫЕ ТРЕКИ (custom_tracks): {len(real_custom)} шт.\n"
-        + "-" * 88
-    )
+    print("\n" + "-" * 88 + f"\n 2. КАСТОМНЫЕ ТРЕКИ (custom_tracks): {len(real_custom)} шт.\n" + "-" * 88)
     if not real_custom:
         print("   (Нет кастомных треков)")
     for idx, item in enumerate(real_custom, 1):
         enabled = item.get("enabled", True) is not False
         url = str(item.get("url") or "").strip()
-        raw_id = str(
-            item.get("id") or f"custom_{hashlib.md5(url.encode()).hexdigest()[:10]}"
-        ).strip()
+        raw_id = str(item.get("id") or f"custom_{hashlib.md5(url.encode()).hexdigest()[:10]}").strip()
         custom_id = re.sub(r"[^a-zA-Z0-9_-]", "_", raw_id)
         if not custom_id.startswith("custom_"):
             custom_id = f"custom_{custom_id}"
@@ -5254,44 +4143,28 @@ def print_status_report() -> None:
     quarantine = load_quarantine()
     total_bytes, mp3_count, free_bytes = measure_directory_stats(OUTPUT_DIR)
     tracks_cache = cache_data.get("tracks") or {}
-    full_meta_cnt = sum(
-        1
-        for e in tracks_cache.values()
-        if (e.get("meta") or {}).get("isrc")
-        and (e.get("meta") or {}).get("release_date")
-    )
+    full_meta_cnt = sum(1 for e in tracks_cache.values() if (e.get("meta") or {}).get("isrc") and (e.get("meta") or {}).get("release_date"))
     ok_cookie, cookie_msg = inspect_cookie_file_health(YT_COOKIE_FILE)
 
     print("\n" + "=" * 88)
     print(f" СТАТУС СИСТЕМЫ И БАЗЫ ДАННЫХ SPOTISYNC | {BUILD_VERSION}")
     print("=" * 88)
-    print(
-        f" • Плейлист Spotify          : {PLAYLIST_URL or cache_data.get('playlist_url') or 'Не задан'} (Рынок: {SPOTIFY_MARKET})"
-    )
-    print(
-        f" • Snapshot ID кэша          : {cache_data.get('snapshot_id') or 'Нет'} (Полный список: {yn(cache_data.get('is_full_playlist'))})"
-    )
-    print(
-        f" • Треков в кэше (.spotisync): {len(tracks_cache)} шт. (Полные ISRC+Год: {full_meta_cnt} шт.)"
-    )
-    print(
-        f" • Скачано на диск ({OUTPUT_DIR}): {len(local_managed)} шт. (Всего MP3 в папке: {mp3_count} шт.)"
-    )
+    print(f" • Плейлист Spotify          : {PLAYLIST_URL or cache_data.get('playlist_url') or 'Не задан'} (Рынок: {SPOTIFY_MARKET})")
+    print(f" • Snapshot ID кэша          : {cache_data.get('snapshot_id') or 'Нет'} (Полный список: {yn(cache_data.get('is_full_playlist'))})")
+    print(f" • Треков в кэше (.spotisync): {len(tracks_cache)} шт. (Полные ISRC+Год: {full_meta_cnt} шт.)")
+    print(f" • Скачано на диск ({OUTPUT_DIR}): {len(local_managed)} шт. (Всего MP3 в папке: {mp3_count} шт.)")
     print(
         f" • Ожидают докачки / Карантин: Докачка: {pending_cnt} шт. | "
         f"В карантине: {len(quarantine)} шт. (TTL: {format_duration(FAIL_TTL_HOURS * 3600)})"
     )
     print(
         f" • Кастомных (.spotitracks)  : Треков: {len(custom_tracks)} шт. | "
-        f"Переопределений: {unique_overrides_cnt} шт. | В черном списке (ignores): {ignores_cnt} шт."
+        f"Переопределений: {unique_overrides_cnt} шт. | В черном списке (ignores): {ignores_cnt} шт. "
+        f"(Удаление скачанных: {yn(SYNC_DELETE_IGNORED)})"
     )
-    print(
-        f" • Место на диске            : Занято: {format_bytes(total_bytes)} | Свободно: {format_bytes(free_bytes)}"
-    )
+    print(f" • Место на диске            : Занято: {format_bytes(total_bytes)} | Свободно: {format_bytes(free_bytes)}")
     print(f" • Авторизация YouTube (18+) : {yn(ok_cookie)} ({cookie_msg})")
-    print(
-        f" • Фоллбэки поиска           : DirectURL->Каскад: {yn(DIRECT_URL_FALLBACK)} | Фоллбэк YT #4: {yn(ENABLE_FALLBACK_SEARCH)}"
-    )
+    print(f" • Фоллбэки поиска           : DirectURL->Каскад: {yn(DIRECT_URL_FALLBACK)} | Фоллбэк YT #4: {yn(ENABLE_FALLBACK_SEARCH)}")
     print("=" * 88)
     if quarantine:
         print_quarantine_report(quarantine=quarantine, cache_data=cache_data)
@@ -5307,9 +4180,7 @@ async def run_retag_all_on_disk() -> None:
         overrides_map, _, _, _ = load_custom_spotitracks()
         tracks_cache = cache_data.get("tracks") or {}
 
-        logger.info(
-            f"=== Запуск перетегирования (--retag) для {len(local_managed)} файлов на диске ==="
-        )
+        logger.info(f"=== Запуск перетегирования (--retag) для {len(local_managed)} файлов на диске ===")
         retagged = 0
         for sp_id, mp3_path in local_managed.items():
             if is_shutting_down():
@@ -5322,9 +4193,7 @@ async def run_retag_all_on_disk() -> None:
                 await asyncio.to_thread(tag_mp3_file, mp3_path, meta)
                 retagged += 1
                 if retagged % 25 == 0 or retagged == len(local_managed):
-                    logger.info(
-                        f"[RETAG] Обновлены ID3-теги: {retagged}/{len(local_managed)}"
-                    )
+                    logger.info(f"[RETAG] Обновлены ID3-теги: {retagged}/{len(local_managed)}")
             except Exception as e:
                 logger.warning(f"Ошибка обновления тегов для {mp3_path.name}: {e}")
         logger.success(f"Перетегирование завершено! Обновлено файлов: {retagged} шт.")
@@ -5332,26 +4201,16 @@ async def run_retag_all_on_disk() -> None:
         current_ctx.reset(token_ctx)
 
 
-def match_tracks_by_query(
-    query: str, pool: list[TrackMeta], cache_tracks_map: dict[str, Any]
-) -> list[TrackMeta]:
+def match_tracks_by_query(query: str, pool: list[TrackMeta], cache_tracks_map: dict[str, Any]) -> list[TrackMeta]:
     q_raw = query.strip()
     if not q_raw:
         return []
     q_low = q_raw.lower()
 
     sp_match = re.search(r"(?:track/|spotify:track:)([a-zA-Z0-9]{22})", q_raw)
-    extracted_sp_id = (
-        sp_match.group(1)
-        if sp_match
-        else (q_raw if len(q_raw) == 22 and q_raw.isalnum() else None)
-    )
+    extracted_sp_id = sp_match.group(1) if sp_match else (q_raw if len(q_raw) == 22 and q_raw.isalnum() else None)
     yt_match = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([a-zA-Z0-9_-]{11})", q_raw)
-    extracted_yt_id = (
-        yt_match.group(1)
-        if yt_match
-        else (q_raw if re.fullmatch(r"[a-zA-Z0-9_-]{11}", q_raw) else None)
-    )
+    extracted_yt_id = yt_match.group(1) if yt_match else (q_raw if re.fullmatch(r"[a-zA-Z0-9_-]{11}", q_raw) else None)
     is_sc_url = "soundcloud.com/" in q_low
 
     exact_matches: list[TrackMeta] = []
@@ -5372,19 +4231,12 @@ def match_tracks_by_query(
 
         full_disp = f"{t.artist} - {t.title}".lower()
         all_art_disp = f"{', '.join(t.artists_all)} - {t.title} {t.album}".lower()
-        if (
-            q_low in full_disp
-            or q_low in all_art_disp
-            or (q_compact and q_compact in compact_alnum(full_disp))
-        ):
+        if q_low in full_disp or q_low in all_art_disp or (q_compact and q_compact in compact_alnum(full_disp)):
             fuzzy_matches.append(t)
             continue
         if q_tokens:
             disp_tokens = normalize_tokens(all_art_disp)
-            if all(
-                any(w.startswith(tok) or tok in w for w in disp_tokens)
-                for tok in q_tokens
-            ):
+            if all(any(w.startswith(tok) or tok in w for w in disp_tokens) for tok in q_tokens):
                 fuzzy_matches.append(t)
 
     return exact_matches or fuzzy_matches
@@ -5409,9 +4261,7 @@ async def handle_single_track_cli(queries: list[str], allow_external: bool) -> N
             pool_map[ct.spotify_id] = ct
 
         if not pool_map and PLAYLIST_URL:
-            logger.info(
-                "Локальный кэш пуст, загружаем список треков плейлиста со Spotify..."
-            )
+            logger.info("Локальный кэш пуст, загружаем список треков плейлиста со Spotify...")
             fetched, snap, _, _, _, _, _ = await fetch_spotify_tracks_with_cache(
                 PLAYLIST_URL, cache_data, ignored_keys=ignored_keys
             )
@@ -5429,9 +4279,7 @@ async def handle_single_track_cli(queries: list[str], allow_external: bool) -> N
                 if is_shutting_down():
                     break
                 if matched := match_tracks_by_query(q, pool_list, tracks_cache):
-                    logger.info(
-                        f"[TRACK SEARCH] По запросу '{q}' найдено совпадений: {len(matched)} шт."
-                    )
+                    logger.info(f"[TRACK SEARCH] По запросу '{q}' найдено совпадений: {len(matched)} шт.")
                     for m in matched:
                         if m.spotify_id not in seen_target_ids:
                             seen_target_ids.add(m.spotify_id)
@@ -5439,91 +4287,43 @@ async def handle_single_track_cli(queries: list[str], allow_external: bool) -> N
                     continue
 
                 if not allow_external:
-                    logger.error(
-                        f"✖ Трек '{q}' НЕ НАЙДЕН в базе (TRACK_ALLOW_EXTERNAL: {yn(allow_external)})! Добавьте --allow-external."
-                    )
+                    logger.error(f"✖ Трек '{q}' НЕ НАЙДЕН в базе (TRACK_ALLOW_EXTERNAL: {yn(allow_external)})! Добавьте --allow-external.")
                     continue
 
                 logger.warning(f"[EXTERNAL TRACK] Создаем внешнюю задачу для '{q}'...")
                 q_strip = q.strip()
                 sp_m = re.search(r"(?:track/|spotify:track:)([a-zA-Z0-9]{22})", q_strip)
-                sp_id_ext = (
-                    sp_m.group(1)
-                    if sp_m
-                    else (q_strip if len(q_strip) == 22 and q_strip.isalnum() else None)
-                )
-                yt_m = re.search(
-                    r"(?:v=|youtu\.be/|shorts/|embed/)([a-zA-Z0-9_-]{11})", q_strip
-                )
-                yt_id_ext = (
-                    yt_m.group(1)
-                    if yt_m
-                    else (
-                        q_strip if re.fullmatch(r"[a-zA-Z0-9_-]{11}", q_strip) else None
-                    )
-                )
+                sp_id_ext = sp_m.group(1) if sp_m else (q_strip if len(q_strip) == 22 and q_strip.isalnum() else None)
+                yt_m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([a-zA-Z0-9_-]{11})", q_strip)
+                yt_id_ext = yt_m.group(1) if yt_m else (q_strip if re.fullmatch(r"[a-zA-Z0-9_-]{11}", q_strip) else None)
 
                 if sp_id_ext:
-                    ext_meta = await fetch_single_spotify_embed_meta(
-                        http_client, sp_id_ext
-                    )
+                    ext_meta = await fetch_single_spotify_embed_meta(http_client, sp_id_ext)
                     if not ext_meta:
-                        logger.error(
-                            f"Не удалось получить метаданные со Spotify для ID: {sp_id_ext}"
-                        )
+                        logger.error(f"Не удалось получить метаданные со Spotify для ID: {sp_id_ext}")
                         continue
-                    await enrich_single_track_via_deezer(
-                        http_client, asyncio.Semaphore(1), ext_meta
-                    )
+                    await enrich_single_track_via_deezer(http_client, asyncio.Semaphore(1), ext_meta)
                     targets_to_process.append(ext_meta)
                 elif yt_id_ext or q_strip.startswith(("http://", "https://")):
-                    direct_link = (
-                        f"https://www.youtube.com/watch?v={yt_id_ext}"
-                        if (yt_id_ext and not q_strip.startswith("http"))
-                        else q_strip
-                    )
+                    direct_link = f"https://www.youtube.com/watch?v={yt_id_ext}" if (yt_id_ext and not q_strip.startswith("http")) else q_strip
                     ext_id = f"custom_ext_{yt_id_ext or hashlib.md5(direct_link.encode()).hexdigest()[:10]}"
                     targets_to_process.append(
                         TrackMeta(
-                            spotify_id=ext_id,
-                            title="External Track",
-                            artist="External Artist",
-                            artists_all=["External Artist"],
-                            album="External Download",
-                            album_artist="External Artist",
-                            release_date="",
-                            track_number="1",
-                            disc_number="1",
-                            duration_sec=0,
-                            isrc=None,
-                            cover_url=None,
-                            direct_url=direct_link,
+                            spotify_id=ext_id, title="External Track", artist="External Artist",
+                            artists_all=["External Artist"], album="External Download", album_artist="External Artist",
+                            release_date="", track_number="1", disc_number="1", duration_sec=0,
+                            isrc=None, cover_url=None, direct_url=direct_link,
                         )
                     )
                 else:
-                    art_s, tit_s = (
-                        (p.strip() for p in q_strip.split("-", 1))
-                        if "-" in q_strip
-                        else ("Unknown Artist", q_strip)
-                    )
+                    art_s, tit_s = (p.strip() for p in q_strip.split("-", 1)) if "-" in q_strip else ("Unknown Artist", q_strip)
                     ext_id = f"custom_ext_{hashlib.md5(q_strip.lower().encode()).hexdigest()[:10]}"
                     ext_meta = TrackMeta(
-                        spotify_id=ext_id,
-                        title=tit_s,
-                        artist=art_s,
-                        artists_all=[art_s],
-                        album=tit_s,
-                        album_artist=art_s,
-                        release_date="",
-                        track_number="1",
-                        disc_number="1",
-                        duration_sec=0,
-                        isrc=None,
-                        cover_url=None,
+                        spotify_id=ext_id, title=tit_s, artist=art_s, artists_all=[art_s],
+                        album=tit_s, album_artist=art_s, release_date="", track_number="1",
+                        disc_number="1", duration_sec=0, isrc=None, cover_url=None,
                     )
-                    await enrich_single_track_via_deezer(
-                        http_client, asyncio.Semaphore(1), ext_meta
-                    )
+                    await enrich_single_track_via_deezer(http_client, asyncio.Semaphore(1), ext_meta)
                     targets_to_process.append(ext_meta)
 
         if not targets_to_process or is_shutting_down():
@@ -5536,28 +4336,18 @@ async def handle_single_track_cli(queries: list[str], allow_external: bool) -> N
                 break
 
             label = f"TRACK #{idx}/{len(targets_to_process)} | {meta.safe_id[:10]} | {meta.display_name[:25]}"
-            ok, reason = await run_worker_with_adaptive_watchdog(
-                meta, label, cache_data, quarantine
-            )
+            ok, reason = await run_worker_with_adaptive_watchdog(meta, label, cache_data, quarantine)
             if ok:
                 ok_cnt += 1
                 clear_quarantine_entry(quarantine, meta.spotify_id)
             elif not is_shutting_down():
-                ttl_h = register_quarantine_failure(
-                    quarantine, meta.spotify_id, reason or "Ошибка --track"
-                )
-                logger.error(
-                    f"[{label}] Не удалось скачать трек: {reason} (карантин: {format_duration(ttl_h * 3600)})"
-                )
+                ttl_h = register_quarantine_failure(quarantine, meta.spotify_id, reason or "Ошибка --track")
+                logger.error(f"[{label}] Не удалось скачать трек: {reason} (карантин: {format_duration(ttl_h * 3600)})")
 
         if ok_cnt > 0 and is_azuracast_configured() and not is_shutting_down():
-            all_mp3s = [
-                p.name for p in OUTPUT_DIR.glob("*.mp3") if p.stat().st_size > 50_000
-            ]
+            all_mp3s = [p.name for p in OUTPUT_DIR.glob("*.mp3") if p.stat().st_size > 50_000]
             await sync_with_azuracast(all_mp3s, ok_cnt)
-        logger.success(
-            f"Команда --track завершена: успешно скачано {ok_cnt} из {len(targets_to_process)} шт."
-        )
+        logger.success(f"Команда --track завершена: успешно скачано {ok_cnt} из {len(targets_to_process)} шт.")
     finally:
         current_ctx.reset(token_ctx)
 
@@ -5573,9 +4363,7 @@ async def run_worker_with_adaptive_watchdog(
         _active_watchdogs.add(watchdog)
     try:
         task = asyncio.create_task(
-            asyncio.to_thread(
-                process_track_sync, meta, label, cache_data, watchdog, quarantine
-            )
+            asyncio.to_thread(process_track_sync, meta, label, cache_data, watchdog, quarantine)
         )
         while not task.done():
             await asyncio.sleep(1.0)
@@ -5625,11 +4413,7 @@ async def run_sync_cycle(
         logger.warning("=== АКТИВИРОВАН РЕЖИМ --redownload: Удаляем старые MP3 ===")
         for mp3_f in OUTPUT_DIR.glob("*.mp3"):
             stem = mp3_f.stem
-            if (
-                stem in (cache_data.get("tracks") or {})
-                or (len(stem) == 22 and stem.isalnum())
-                or stem.startswith("custom_")
-            ):
+            if stem in (cache_data.get("tracks") or {}) or (len(stem) == 22 and stem.isalnum()) or stem.startswith("custom_"):
                 mp3_f.unlink(missing_ok=True)
 
     local_managed, _ = reconcile_cache_with_disk(cache_data)
@@ -5637,15 +4421,14 @@ async def run_sync_cycle(
 
     target_playlist = PLAYLIST_URL or cache_data.get("playlist_url", "")
     if not target_playlist and not custom_tracks:
-        logger.error(
-            "Не указан PLAYLIST_URL и нет кастомных треков в .spotitracks.json!"
-        )
+        logger.error("Не указан PLAYLIST_URL и нет кастомных треков в .spotitracks.json!")
         return
 
     logger.info(
         f"=== Старт цикла синхронизации [{BUILD_VERSION}] | "
         f"Фильтр недоступных: {yn(FILTER_UNAVAILABLE_SPOTIFY)} | IgnoreCachedURLs: {yn(IGNORE_CACHED_URLS)} | "
         f"DirectURL->Каскад: {yn(DIRECT_URL_FALLBACK)} | Фоллбэк YT #4: {yn(ENABLE_FALLBACK_SEARCH)} | "
+        f"DelRemoved: {yn(SYNC_DELETE_REMOVED)} | DelIgnored: {yn(SYNC_DELETE_IGNORED)} | "
         f"Обход карантина: {yn(ignore_quarantine)} | AzuraCast: {yn(is_azuracast_configured())} | "
         f"DryRun: {yn(dry_run)} | Плейлист: {target_playlist} ==="
     )
@@ -5660,16 +4443,9 @@ async def run_sync_cycle(
 
     if target_playlist:
         (
-            tracks,
-            new_snapshot,
-            from_cache_hit,
-            raw_playlist_total,
-            filtered_unavailable_count,
-            parse_dt,
-            enrich_dt,
-        ) = await fetch_spotify_tracks_with_cache(
-            target_playlist, cache_data, ignored_keys=ignored_keys
-        )
+            tracks, new_snapshot, from_cache_hit, raw_playlist_total,
+            filtered_unavailable_count, parse_dt, enrich_dt,
+        ) = await fetch_spotify_tracks_with_cache(target_playlist, cache_data, ignored_keys=ignored_keys)
 
         for t in tracks:
             if t.cover_url:
@@ -5711,29 +4487,56 @@ async def run_sync_cycle(
     playlist_ids = {t.spotify_id for t in tracks}
     cache_tracks_map = cache_data.setdefault("tracks", {})
 
+    deleted_count = 0
     if ignored_keys:
-        for cached_id, cached_entry in list(cache_tracks_map.items()):
-            if cached_id not in playlist_ids and cached_id not in local_managed:
-                if cached_id in ignored_keys:
-                    del cache_tracks_map[cached_id]
+        ignored_downloaded_ids = [
+            ign_id for ign_id in ignored_keys
+            if ign_id in local_managed or ign_id in cache_tracks_map
+        ]
+        if SYNC_DELETE_IGNORED and ignored_downloaded_ids and not dry_run:
+            ign_files_to_unlink = [
+                local_managed[ign_id].name
+                for ign_id in ignored_downloaded_ids
+                if ign_id in local_managed
+            ]
+            if ign_files_to_unlink and is_azuracast_configured():
+                await unassign_tracks_from_azuracast_playlist(ign_files_to_unlink)
+
+            for ign_id in ignored_downloaded_ids:
+                meta_d = (cache_tracks_map.get(ign_id) or {}).get("meta") or {}
+                disp_ign = (
+                    f"{meta_d['artist']} - {meta_d['title']}"
+                    if meta_d.get("artist") and meta_d.get("title")
+                    else ign_id
+                )
+                if mp3_path := local_managed.pop(ign_id, None):
+                    try:
+                        mp3_path.unlink(missing_ok=True)
+                        deleted_count += 1
+                        logger.info(
+                            f"[IGNORES-DEL] Удален ранее скачанный трек из черного списка ignores: "
+                            f"{mp3_path.name} ({disp_ign})"
+                        )
+                    except OSError as e:
+                        logger.error(f"Ошибка удаления игнорируемого трека {mp3_path.name}: {e}")
+                cache_tracks_map.pop(ign_id, None)
+        else:
+            for ign_id in ignored_downloaded_ids:
+                if ign_id not in local_managed:
+                    cache_tracks_map.pop(ign_id, None)
 
     forced_resync_count = 0
     for t in tracks:
         prev_entry = cache_tracks_map.get(t.spotify_id)
-        prev_source_url = (
-            (prev_entry.get("source_url") or "").strip() if prev_entry else ""
-        )
-        prev_override_url = (
-            (prev_entry.get("override_url") or "").strip() if prev_entry else ""
-        )
-        prev_source_type = (
-            (prev_entry.get("source_type") or "").strip() if prev_entry else ""
-        )
+        prev_source_url = (prev_entry.get("source_url") or "").strip() if prev_entry else ""
+        prev_override_url = (prev_entry.get("override_url") or "").strip() if prev_entry else ""
+        prev_source_type = (prev_entry.get("source_type") or "").strip() if prev_entry else ""
 
         if t.direct_url and t.spotify_id in local_managed and not dry_run:
-            already_synced_with_this_override = is_same_media_url(
-                prev_source_url, t.direct_url
-            ) or is_same_media_url(prev_override_url, t.direct_url)
+            already_synced_with_this_override = (
+                is_same_media_url(prev_source_url, t.direct_url)
+                or is_same_media_url(prev_override_url, t.direct_url)
+            )
             if not already_synced_with_this_override:
                 local_managed.pop(t.spotify_id, None)
                 forced_resync_count += 1
@@ -5742,9 +4545,7 @@ async def run_sync_cycle(
                     f"проверяем новый источник (текущий MP3 сохранен на случай совпадения или сбоя)!"
                 )
 
-        is_currently_on_disk = (OUTPUT_DIR / t.id_filename).exists() and (
-            OUTPUT_DIR / t.id_filename
-        ).stat().st_size > 50_000
+        is_currently_on_disk = (OUTPUT_DIR / t.id_filename).exists() and (OUTPUT_DIR / t.id_filename).stat().st_size > 50_000
         if t.spotify_id not in cache_tracks_map:
             cache_tracks_map[t.spotify_id] = {
                 "meta": asdict(t),
@@ -5754,9 +4555,7 @@ async def run_sync_cycle(
                 "source_type": "spotitracks" if t.direct_url else None,
                 "score": 100 if t.direct_url else 0,
                 "downloaded": is_currently_on_disk,
-                "file_size": (OUTPUT_DIR / t.id_filename).stat().st_size
-                if is_currently_on_disk
-                else 0,
+                "file_size": (OUTPUT_DIR / t.id_filename).stat().st_size if is_currently_on_disk else 0,
                 "synced_at": int(time.time()),
             }
         else:
@@ -5764,10 +4563,7 @@ async def run_sync_cycle(
             cache_tracks_map[t.spotify_id]["filename"] = t.id_filename
             if t.direct_url and t.spotify_id in local_managed:
                 cache_tracks_map[t.spotify_id]["override_url"] = t.direct_url
-                if (
-                    is_same_media_url(prev_source_url, t.direct_url)
-                    or not prev_source_url
-                ):
+                if is_same_media_url(prev_source_url, t.direct_url) or not prev_source_url:
                     cache_tracks_map[t.spotify_id]["source_url"] = t.direct_url
                     cache_tracks_map[t.spotify_id]["source_type"] = "spotitracks"
             elif not t.direct_url:
@@ -5778,16 +4574,9 @@ async def run_sync_cycle(
     if new_snapshot:
         cache_data["snapshot_id"] = new_snapshot
 
-    deleted_count = 0
-    removed_ids = (
-        set(local_managed.keys()) | set(cache_tracks_map.keys())
-    ) - playlist_ids
+    removed_ids = ((set(local_managed.keys()) | set(cache_tracks_map.keys())) - playlist_ids) - ignored_keys
     if SYNC_DELETE_REMOVED and removed_ids and not dry_run:
-        files_to_unlink = [
-            local_managed[rem_id].name
-            for rem_id in removed_ids
-            if rem_id in local_managed
-        ]
+        files_to_unlink = [local_managed[rem_id].name for rem_id in removed_ids if rem_id in local_managed]
         if files_to_unlink and is_azuracast_configured():
             await unassign_tracks_from_azuracast_playlist(files_to_unlink)
         for rem_id in removed_ids:
@@ -5795,9 +4584,7 @@ async def run_sync_cycle(
                 try:
                     local_managed[rem_id].unlink()
                     deleted_count += 1
-                    logger.info(
-                        f"[SYNC-DEL] Удален выбывший трек: {local_managed[rem_id].name}"
-                    )
+                    logger.info(f"[SYNC-DEL] Удален выбывший трек: {local_managed[rem_id].name}")
                 except OSError as e:
                     logger.error(f"Ошибка удаления {local_managed[rem_id].name}: {e}")
             cache_tracks_map.pop(rem_id, None)
@@ -5822,18 +4609,11 @@ async def run_sync_cycle(
             skipped_count += 1
             if show_skipped:
                 skip_log_fn(f"[SKIP] Уже на диске: {t.id_filename} ({t.display_name})")
-        elif (
-            (not ignore_quarantine)
-            and (t.spotify_id in quarantine)
-            and (not t.direct_url)
-        ):
+        elif (not ignore_quarantine) and (t.spotify_id in quarantine) and (not t.direct_url):
             quarantined_count += 1
             q_info = quarantine[t.spotify_id]
             q_ttl = float(q_info.get("ttl_hours", FAIL_TTL_HOURS))
-            left_sec = max(
-                0.0,
-                q_ttl * 3600 - (time.time() - float(q_info.get("time", time.time()))),
-            )
+            left_sec = max(0.0, q_ttl * 3600 - (time.time() - float(q_info.get("time", time.time()))))
             if show_quarantine:
                 quar_log_fn(
                     f"[QUARANTINE] Пропуск ({format_duration(left_sec)} из {format_duration(q_ttl * 3600)} осталось | "
@@ -5866,9 +4646,7 @@ async def run_sync_cycle(
                     return False
                 label = f"#{idx:0{width}d}/{total_dl} | {meta.safe_id[:8]} | {meta.display_name[:25]}"
                 try:
-                    ok, fail_reason = await run_worker_with_adaptive_watchdog(
-                        meta, label, cache_data, quarantine
-                    )
+                    ok, fail_reason = await run_worker_with_adaptive_watchdog(meta, label, cache_data, quarantine)
                 except asyncio.CancelledError:
                     return False
                 except Exception as e:
@@ -5882,25 +4660,16 @@ async def run_sync_cycle(
                     return False
 
                 reason_str = fail_reason or "Не удалось найти или скачать трек"
-                ttl_assigned = register_quarantine_failure(
-                    quarantine, meta.spotify_id, reason_str
-                )
-                logger.warning(
-                    f"[{label}] Отправлен в карантин на {format_duration(ttl_assigned * 3600)} | Причина: {reason_str}"
-                )
+                ttl_assigned = register_quarantine_failure(quarantine, meta.spotify_id, reason_str)
+                logger.warning(f"[{label}] Отправлен в карантин на {format_duration(ttl_assigned * 3600)} | Причина: {reason_str}")
                 return False
 
-        results = await asyncio.gather(
-            *(worker(i, t) for i, t in enumerate(to_download, 1)),
-            return_exceptions=True,
-        )
+        results = await asyncio.gather(*(worker(i, t) for i, t in enumerate(to_download, 1)), return_exceptions=True)
         downloaded_ok = sum(1 for r in results if r is True)
         failed_count = sum(1 for r in results if r is False)
 
     if is_azuracast_configured() and not dry_run and not is_shutting_down():
-        expected_mp3_names = [
-            t.id_filename for t in tracks if (OUTPUT_DIR / t.id_filename).exists()
-        ]
+        expected_mp3_names = [t.id_filename for t in tracks if (OUTPUT_DIR / t.id_filename).exists()]
         await sync_with_azuracast(expected_mp3_names, downloaded_ok)
 
     if is_shutting_down():
@@ -5955,40 +4724,17 @@ async def main_loop(
         first_pass = False
         if once or SYNC_INTERVAL_MINUTES <= 0 or is_shutting_down():
             break
-        logger.info(
-            f"Сон до следующей синхронизации ({format_duration(SYNC_INTERVAL_MINUTES * 60)})..."
-        )
+        logger.info(f"Сон до следующей синхронизации ({format_duration(SYNC_INTERVAL_MINUTES * 60)})...")
         await sleep_interruptible(SYNC_INTERVAL_MINUTES * 60)
 
 
 def apply_env_key_value_override(key: str, val: str) -> None:
-    global \
-        PLAYLIST_URL, \
-        SPOTIFY_MARKET, \
-        FILTER_UNAVAILABLE_SPOTIFY, \
-        IGNORE_CACHED_URLS, \
-        TRACK_ALLOW_EXTERNAL
-    global \
-        SYNC_INTERVAL_MINUTES, \
-        OUTPUT_DIR, \
-        CACHE_FILENAME, \
-        CUSTOM_TRACKS_FILENAME, \
-        STAGING_DIR
-    global \
-        SYNC_DELETE_REMOVED, \
-        PUID, \
-        PGID, \
-        CONCURRENT_DOWNLOADS, \
-        YTDLP_RETRIES, \
-        YTDLP_SOCKET_TIMEOUT_SEC
+    global PLAYLIST_URL, SPOTIFY_MARKET, FILTER_UNAVAILABLE_SPOTIFY, IGNORE_CACHED_URLS, TRACK_ALLOW_EXTERNAL
+    global SYNC_INTERVAL_MINUTES, OUTPUT_DIR, CACHE_FILENAME, CUSTOM_TRACKS_FILENAME, STAGING_DIR
+    global SYNC_DELETE_REMOVED, SYNC_DELETE_IGNORED, PUID, PGID, CONCURRENT_DOWNLOADS, YTDLP_RETRIES, YTDLP_SOCKET_TIMEOUT_SEC
     global WORKER_BASE_TIMEOUT_SEC, WORKER_SEARCH_TIMEOUT_SEC, WORKER_STALL_TIMEOUT_SEC
     global WORKER_STAGE_MAX_TIMEOUT_SEC, MIN_ACCEPTABLE_SPEED_KBPS, FAIL_TTL_HOURS
-    global \
-        FAILED_CACHE_FILE, \
-        YT_COOKIE_FILE, \
-        POT_PROVIDER_URL, \
-        AUDIO_NORMALIZE, \
-        AUDIO_TRIM_SILENCE
+    global FAILED_CACHE_FILE, YT_COOKIE_FILE, POT_PROVIDER_URL, AUDIO_NORMALIZE, AUDIO_TRIM_SILENCE
     global ENABLE_FALLBACK_SEARCH, DIRECT_URL_FALLBACK
     global AZURACAST_URL, AZURACAST_API_KEY, AZURACAST_STATION_ID, AZURACAST_PLAYLIST_ID
     global AZURACAST_PLAYLIST_NAME, AZURACAST_MEDIA_SUBDIR
@@ -6021,6 +4767,8 @@ def apply_env_key_value_override(key: str, val: str) -> None:
                 STAGING_DIR = Path(v)
             case "SYNC_DELETE_REMOVED" | "SYNC_DELETE":
                 SYNC_DELETE_REMOVED = parse_str_bool(v)
+            case "SYNC_DELETE_IGNORED" | "DELETE_IGNORED_TRACKS" | "SYNC_DELETE_IGNORES":
+                SYNC_DELETE_IGNORED = parse_str_bool(v)
             case "PUID":
                 PUID = int(v)
             case "PGID":
@@ -6033,19 +4781,11 @@ def apply_env_key_value_override(key: str, val: str) -> None:
                 YTDLP_SOCKET_TIMEOUT_SEC = max(5, int(v))
             case "WORKER_TIMEOUT_SEC" | "WORKER_BASE_TIMEOUT_SEC" | "WORKER_TIMEOUT":
                 WORKER_BASE_TIMEOUT_SEC = max(30, int(v))
-            case (
-                "WORKER_SEARCH_STEP_TIMEOUT_SEC"
-                | "WORKER_SEARCH_TIMEOUT_SEC"
-                | "SEARCH_TIMEOUT"
-            ):
+            case "WORKER_SEARCH_STEP_TIMEOUT_SEC" | "WORKER_SEARCH_TIMEOUT_SEC" | "SEARCH_TIMEOUT":
                 WORKER_SEARCH_TIMEOUT_SEC = max(15.0, float(v))
             case "WORKER_STALL_TIMEOUT_SEC" | "STALL_TIMEOUT":
                 WORKER_STALL_TIMEOUT_SEC = max(15, int(v))
-            case (
-                "WORKER_MAX_HARD_TIMEOUT_SEC"
-                | "WORKER_STAGE_MAX_TIMEOUT_SEC"
-                | "MAX_HARD_TIMEOUT"
-            ):
+            case "WORKER_MAX_HARD_TIMEOUT_SEC" | "WORKER_STAGE_MAX_TIMEOUT_SEC" | "MAX_HARD_TIMEOUT":
                 WORKER_STAGE_MAX_TIMEOUT_SEC = max(60, int(v))
             case "MIN_ACCEPTABLE_SPEED_KBPS" | "MIN_SPEED_KBPS":
                 MIN_ACCEPTABLE_SPEED_KBPS = max(1.0, float(v))
@@ -6154,6 +4894,8 @@ BOOLEAN_CLI_FLAGS_MAP: dict[str, tuple[str, str]] = {
     "--no-allow-external": ("TRACK_ALLOW_EXTERNAL", "false"),
     "--sync-delete": ("SYNC_DELETE_REMOVED", "true"),
     "--no-sync-delete": ("SYNC_DELETE_REMOVED", "false"),
+    "--sync-delete-ignored": ("SYNC_DELETE_IGNORED", "true"),
+    "--no-sync-delete-ignored": ("SYNC_DELETE_IGNORED", "false"),
     "--normalize": ("AUDIO_NORMALIZE", "true"),
     "--no-normalize": ("AUDIO_NORMALIZE", "false"),
     "--trim-silence": ("AUDIO_TRIM_SILENCE", "true"),
@@ -6211,17 +4953,13 @@ def parse_cli_arguments(raw_argv: list[str]) -> tuple[list[str], list[str]]:
         if "=" in token and token.startswith("--"):
             flag_part, val_part = token.split("=", 1)
             flag_low = flag_part.lower()
-            apply_env_key_value_override(
-                VALUE_CLI_FLAGS_MAP.get(flag_low, flag_low.lstrip("-")), val_part
-            )
+            apply_env_key_value_override(VALUE_CLI_FLAGS_MAP.get(flag_low, flag_low.lstrip("-")), val_part)
             i += 1
             continue
 
         token_low = token.lower()
         if token_low in VALUE_CLI_FLAGS_MAP and i + 1 < len(raw_argv):
-            apply_env_key_value_override(
-                VALUE_CLI_FLAGS_MAP[token_low], raw_argv[i + 1]
-            )
+            apply_env_key_value_override(VALUE_CLI_FLAGS_MAP[token_low], raw_argv[i + 1])
             i += 2
             continue
 
@@ -6242,17 +4980,11 @@ def install_docker_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
-    for sig in (
-        signal.SIGTERM,
-        signal.SIGINT,
-        getattr(signal, "SIGHUP", signal.SIGTERM),
-    ):
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", signal.SIGTERM)):
         try:
             loop.add_signal_handler(sig, _on_signal, sig.name)
         except (NotImplementedError, RuntimeError, ValueError):
-            signal.signal(
-                sig, lambda s, _f: trigger_graceful_shutdown(signal.Signals(s).name)
-            )
+            signal.signal(sig, lambda s, _f: trigger_graceful_shutdown(signal.Signals(s).name))
 
 
 async def async_main() -> None:
@@ -6264,12 +4996,8 @@ async def async_main() -> None:
     loop.set_default_executor(executor)
 
     force_loop = any(f in norm_args for f in ("--loop", "--daemon"))
-    once_flag = (
-        any(f in norm_args for f in ("--once", "-1", "--dry-run")) and not force_loop
-    )
-    ignore_quarantine_flag = any(
-        f in norm_args for f in ("--ignore-quarantine", "--no-quarantine")
-    )
+    once_flag = any(f in norm_args for f in ("--once", "-1", "--dry-run")) and not force_loop
+    ignore_quarantine_flag = any(f in norm_args for f in ("--ignore-quarantine", "--no-quarantine"))
     redownload_flag = any(f in norm_args for f in ("--redownload", "--force-dl"))
     rebuild_flag = "--rebuild" in norm_args
     dry_run_flag = "--dry-run" in norm_args
@@ -6292,16 +5020,10 @@ async def async_main() -> None:
         elif "--azura-check" in norm_args:
             await check_azuracast_connectivity()
         elif "--azura-only" in norm_args:
-            all_mp3 = (
-                [p.name for p in OUTPUT_DIR.glob("*.mp3") if p.stat().st_size > 50_000]
-                if OUTPUT_DIR.exists()
-                else []
-            )
+            all_mp3 = [p.name for p in OUTPUT_DIR.glob("*.mp3") if p.stat().st_size > 50_000] if OUTPUT_DIR.exists() else []
             await sync_with_azuracast(all_mp3, 0)
         elif track_queries:
-            await handle_single_track_cli(
-                track_queries, allow_external=TRACK_ALLOW_EXTERNAL
-            )
+            await handle_single_track_cli(track_queries, allow_external=TRACK_ALLOW_EXTERNAL)
             if (force_loop or "--sync" in norm_args) and not is_shutting_down():
                 await main_loop(once=not force_loop)
         elif rebuild_flag:
