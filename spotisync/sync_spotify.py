@@ -32,8 +32,8 @@ import yt_dlp
 load_dotenv()
 
 BUILD_VERSION = (
-    "v7.3.15-MODERN (Python 3.12+ | Auto-Delete Previously Downloaded Ignored Tracks | "
-    "Strict Spotify-ID .spotitracks.json Ignores Priority | Ceiling Time Format)"
+    "v7.3.16-MODERN (Python 3.12+ | AzuraCast AutoDJ Queue Clear on Sync/Delete | "
+    "Auto-Delete Ignored Tracks | Strict Spotify-ID Ignores Priority)"
 )
 
 TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
@@ -3710,6 +3710,20 @@ async def resolve_azuracast_playlist_id(
     return target_pl_id, (target_pl_name or str(target_pl_id or ""))
 
 
+async def clear_azuracast_queue(client: httpx.AsyncClient, headers: dict[str, str], station_id: str) -> None:
+    try:
+        r_clear = await client.post(
+            f"{AZURACAST_URL}/api/station/{station_id}/queue/clear",
+            headers=headers,
+        )
+        if r_clear.status_code in (200, 204):
+            logger.info(f"[AZURACAST] Очередь AutoDJ станции #{station_id} сброшена (ротация обновлена).")
+        else:
+            logger.debug(f"[AZURACAST] Статус сброса очереди: HTTP {r_clear.status_code}")
+    except Exception as e:
+        logger.debug(f"[AZURACAST] Не удалось сбросить очередь станции #{station_id}: {e}")
+
+
 async def unassign_tracks_from_azuracast_playlist(filenames_to_remove: list[str]) -> None:
     if not filenames_to_remove or not is_azuracast_configured() or is_shutting_down():
         return
@@ -3754,6 +3768,7 @@ async def unassign_tracks_from_azuracast_playlist(filenames_to_remove: list[str]
                         total_unlinked += len(chunk)
             if total_unlinked > 0:
                 logger.info(f"Убрано {total_unlinked} треков из плейлиста AzuraCast '{target_pl_name}' (ID: {target_pl_id}).")
+                await clear_azuracast_queue(client, headers, station_id)
     except Exception as e:
         logger.warning(f"Ошибка при удалении треков из плейлиста AzuraCast: {e}")
     finally:
@@ -3823,6 +3838,7 @@ async def sync_with_azuracast(expected_filenames: list[str], new_downloads_count
                 logger.success(
                     f"В плейлист AzuraCast #{target_pl_id} добавлено {total_added} новых треков (всего: {already_assigned + total_added})!"
                 )
+                await clear_azuracast_queue(client, headers, station_id)
     except Exception as e:
         logger.warning(f"Ошибка синхронизации с AzuraCast API: {e}")
     finally:
