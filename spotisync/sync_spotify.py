@@ -32,11 +32,12 @@ import yt_dlp
 load_dotenv()
 
 BUILD_VERSION = (
-    "v7.3.17-MODERN (Python 3.12+ | AzuraCast Media Indexer Polling & Cache Flush | "
-    "AutoDJ Queue Clear | Auto-Delete Ignored Tracks)"
+    "v7.3.18-MODERN (Python 3.12+ | Metadata Enrichment Quarantine failed_metadata.json | "
+    "Customizable Smart TIME_FORMAT | AzuraCast Polling & Auto-Delete Ignored)"
 )
 
 TRUE_VALUES = frozenset({"true", "1", "yes", "on"})
+TIME_FORMAT: str = os.environ.get("TIME_FORMAT", "%hч %mмин %sсек") or "%hч %mмин %sсек"
 
 
 def parse_env_bool(key: str, default: str = "false") -> bool:
@@ -53,19 +54,37 @@ def yn(val: Any) -> str:
 
 def format_duration(seconds: float | int) -> str:
     total_sec = math.ceil(max(0.0, float(seconds)))
-    if total_sec <= 0:
-        return "0сек"
+    fmt = TIME_FORMAT or "%hч %mмин %sсек"
+    tokens = list(re.finditer(r"%([hms])([^%]*)", fmt))
+    if not tokens:
+        return f"{total_sec}сек"
 
-    hours, rem = divmod(total_sec, 3600)
-    mins, secs = divmod(rem, 60)
+    has_h = any(m.group(1) == "h" for m in tokens)
+    has_m = any(m.group(1) == "m" for m in tokens)
 
+    if has_h:
+        hours, rem = divmod(total_sec, 3600)
+        mins, secs = divmod(rem, 60) if has_m else (0, rem)
+    elif has_m:
+        hours = 0
+        mins, secs = divmod(total_sec, 60)
+    else:
+        hours = mins = 0
+        secs = total_sec
+
+    values = {"h": hours, "m": mins, "s": secs}
     parts: list[str] = []
-    if hours > 0:
-        parts.append(f"{hours}ч")
-    if mins > 0:
-        parts.append(f"{mins}мин")
-    if secs > 0 or not parts:
-        parts.append(f"{secs}сек")
+    for m in tokens:
+        unit = m.group(1)
+        suffix = m.group(2).rstrip()
+        val = values[unit]
+        if val > 0 or (unit == "s" and total_sec == 0 and not parts):
+            parts.append(f"{val}{suffix}")
+
+    if not parts:
+        last_m = tokens[-1]
+        parts.append(f"0{last_m.group(2).rstrip()}")
+
     return " ".join(parts)
 
 
@@ -318,6 +337,8 @@ MIN_ACCEPTABLE_SPEED_BPS: float = MIN_ACCEPTABLE_SPEED_KBPS * 1024.0
 
 FAIL_TTL_HOURS: float = max(0.0, float(os.environ.get("FAIL_TTL_HOURS", "72")))
 FAILED_CACHE_FILE: Path = Path(os.environ.get("FAILED_CACHE_FILE", "/app/data/failed_tracks.json"))
+META_FAIL_TTL_HOURS: float = max(0.0, float(os.environ.get("META_FAIL_TTL_HOURS", "24")))
+FAILED_META_CACHE_FILE: Path = Path(os.environ.get("FAILED_META_CACHE_FILE", "/app/data/failed_metadata.json"))
 YT_COOKIE_FILE: Path = Path(os.environ.get("YT_COOKIE_FILE", "/app/data/cookies.txt"))
 POT_PROVIDER_URL: str = os.environ.get("POT_PROVIDER_URL", "").strip()
 
@@ -437,6 +458,7 @@ CYR_TO_LAT_TABLE = str.maketrans({
 file_move_lock = threading.Lock()
 cache_lock = threading.Lock()
 quarantine_lock = threading.Lock()
+meta_quarantine_lock = threading.Lock()
 
 
 def transliterate_cyr_to_lat(text: str) -> str:
@@ -1217,6 +1239,7 @@ async def remove_cache_and_managed_files_async(wipe_all: bool = False) -> None:
                         logger.error(f"Не удалось удалить {item.name}: {e}")
 
         FAILED_CACHE_FILE.unlink(missing_ok=True)
+        FAILED_META_CACHE_FILE.unlink(missing_ok=True)
         logger.success(
             f"Очистка завершена! Удалено основных файлов/папок: {removed_files} шт. | "
             f"Удалено скрытых файлов кэша: {removed_hidden} шт. (Файл {preserved_spotitracks} сохранен)."
@@ -1332,6 +1355,72 @@ def save_quarantine_unlocked(quarantine: dict[str, dict[str, Any]]) -> None:
         tmp_q.replace(FAILED_CACHE_FILE)
     except OSError as e:
         logger.warning(f"Не удалось сохранить кэш карантина: {e}")
+
+
+def load_meta_quarantine() -> dict[str, dict[str, Any]]:
+    if not FAILED_META_CACHE_FILE.exists() or META_FAIL_TTL_HOURS <= 0:
+        return {}
+    try:
+        data = parse_jsonc(FAILED_META_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        now = time.time()
+        return {
+            k: v
+            for k, v in data.items()
+            if isinstance(v, dict)
+            and (now - float(v.get("time", now))) < (float(v.get("ttl_hours", max(24.0, META_FAIL_TTL_HOURS))) * 3600)
+        }
+    except Exception:
+        return {}
+
+
+def save_meta_quarantine_unlocked(meta_quarantine: dict[str, dict[str, Any]]) -> None:
+    if META_FAIL_TTL_HOURS <= 0:
+        return
+    try:
+        FAILED_META_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_q = FAILED_META_CACHE_FILE.with_suffix(".tmp")
+        tmp_q.write_text(json.dumps(meta_quarantine, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_q.replace(FAILED_META_CACHE_FILE)
+    except OSError as e:
+        logger.warning(f"Не удалось сохранить кэш карантина метаданных: {e}")
+
+
+def register_meta_quarantine_failure(
+    meta_quarantine: dict[str, dict[str, Any]],
+    spotify_id: str,
+    service_fails_added: int,
+    missing_fields: str,
+    reason: str,
+) -> float:
+    if is_shutting_down() or META_FAIL_TTL_HOURS <= 0:
+        return 0.0
+    with meta_quarantine_lock:
+        prev = meta_quarantine.get(spotify_id) or {}
+        attempts = int(prev.get("attempts", 0)) + 1
+        total_service_fails = int(prev.get("service_fails", 0)) + max(1, service_fails_added)
+        base_ttl = max(24.0, META_FAIL_TTL_HOURS)
+        ttl_hours = min(base_ttl * (2.0 ** max(0, attempts - 1)), max(base_ttl, 168.0))
+        meta_quarantine[spotify_id] = {
+            "time": time.time(),
+            "ttl_hours": round(ttl_hours, 2),
+            "attempts": attempts,
+            "service_fails": total_service_fails,
+            "missing": missing_fields,
+            "reason": reason,
+        }
+        save_meta_quarantine_unlocked(meta_quarantine)
+        return ttl_hours
+
+
+def clear_meta_quarantine_entry(meta_quarantine: dict[str, dict[str, Any]] | None, spotify_id: str) -> None:
+    if meta_quarantine is None:
+        return
+    with meta_quarantine_lock:
+        if spotify_id in meta_quarantine:
+            del meta_quarantine[spotify_id]
+            save_meta_quarantine_unlocked(meta_quarantine)
 
 
 def inspect_cookie_file_health(cookie_path: Path) -> tuple[bool, str]:
@@ -2027,7 +2116,9 @@ async def enrich_via_apple_itunes(
             if (col_name := (best_item.get("collectionName") or "").strip()) and tr.album in ("Single", "Spotify Playlist", ""):
                 tr.album = re.sub(r"\s*-\s*Single$", "", col_name, flags=re.I)
 
-            return True, f"получен Год: {tr.release_year}"
+            if tr.release_year != "N/A":
+                return True, f"получен Год: {tr.release_year}"
+            return False, "в карточке iTunes отсутствует дата релиза"
         except Exception as e:
             return False, f"ошибка ({type(e).__name__})"
 
@@ -2274,11 +2365,13 @@ async def enrich_tracks_metadata(
     tracks: list[TrackMeta],
     web_token: str | None,
     cache_data: dict[str, Any],
+    ignore_quarantine: bool = False,
 ) -> tuple[list[TrackMeta], int]:
     if not tracks:
         return tracks, 0
 
     cached_tracks = cache_data.get("tracks", {})
+    meta_quarantine = load_meta_quarantine()
     enriched_result: list[TrackMeta | None] = []
     to_fetch_indices: list[int] = []
     pre_filtered = 0
@@ -2290,6 +2383,7 @@ async def enrich_tracks_metadata(
             restored.direct_url = t.direct_url
             if is_valid_spotify_track(restored):
                 enriched_result.append(restored)
+                clear_meta_quarantine_entry(meta_quarantine, t.spotify_id)
             else:
                 enriched_result.append(None)
                 pre_filtered += 1
@@ -2324,13 +2418,13 @@ async def enrich_tracks_metadata(
 
     spotify_rest_cooldown_until: float = 0.0
     spotify_rest_long_ban_logged = False
-    api_filtered = ok_spotify = ok_deezer = ok_mb_apple = partial_ok = failed_all = processed_count = 0
+    api_filtered = ok_spotify = ok_deezer = ok_mb_apple = partial_ok = failed_all = skipped_meta_q = processed_count = 0
 
     ext_limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
     async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": BROWSER_UA}, limits=ext_limits) as ext_client:
 
         async def enrich_single_track_chain(idx: int) -> None:
-            nonlocal api_filtered, ok_spotify, ok_deezer, ok_mb_apple, partial_ok, failed_all, processed_count
+            nonlocal api_filtered, ok_spotify, ok_deezer, ok_mb_apple, partial_ok, failed_all, skipped_meta_q, processed_count
             nonlocal spotify_rest_cooldown_until, spotify_rest_long_ban_logged
             if is_shutting_down():
                 return
@@ -2393,6 +2487,7 @@ async def enrich_tracks_metadata(
 
                 if tr.has_full_meta:
                     ok_spotify += 1
+                    clear_meta_quarantine_entry(meta_quarantine, sp_id)
                     return
 
                 if tr.release_year == "N/A":
@@ -2404,38 +2499,75 @@ async def enrich_tracks_metadata(
 
                 if tr.has_full_meta:
                     ok_spotify += 1
+                    clear_meta_quarantine_entry(meta_quarantine, sp_id)
                     return
 
+                if (not ignore_quarantine) and (sp_id in meta_quarantine):
+                    skipped_meta_q += 1
+                    if tr.isrc or tr.release_year != "N/A":
+                        partial_ok += 1
+                    else:
+                        failed_all += 1
+                    if LOG_SHOW_QUARANTINE or logger.isEnabledFor(logging.DEBUG):
+                        mq_info = meta_quarantine[sp_id]
+                        mq_ttl = float(mq_info.get("ttl_hours", max(24.0, META_FAIL_TTL_HOURS)))
+                        mq_left = max(0.0, mq_ttl * 3600 - (time.time() - float(mq_info.get("time", time.time()))))
+                        log_mq = logger.info if LOG_SHOW_QUARANTINE else logger.debug
+                        log_mq(
+                            f"[META-QUARANTINE] Пропуск внешних API ({format_duration(mq_left)} из {format_duration(mq_ttl * 3600)} осталось | "
+                            f"фейлов сервисов: {int(mq_info.get('service_fails', 1))}) -> {tr.display_name}"
+                        )
+                    return
+
+                service_fails = 0
                 dz_ok, dz_reason = await enrich_single_track_via_deezer(ext_client, dz_sem, tr)
                 if dz_ok and tr.has_full_meta:
                     ok_deezer += 1
+                    clear_meta_quarantine_entry(meta_quarantine, sp_id)
                     return
+                if not dz_ok:
+                    service_fails += 1
 
                 if not tr.isrc:
                     mb_ok, mb_reason = await enrich_via_musicbrainz(ext_client, mb_sem, tr)
                     if mb_ok and tr.has_full_meta:
                         ok_mb_apple += 1
+                        clear_meta_quarantine_entry(meta_quarantine, sp_id)
                         return
+                    if not tr.isrc:
+                        service_fails += 1
 
                 if tr.release_year == "N/A":
                     _, apple_reason = await enrich_via_apple_itunes(ext_client, apple_sem, tr)
                     if tr.has_full_meta:
                         ok_mb_apple += 1
+                        clear_meta_quarantine_entry(meta_quarantine, sp_id)
                         return
+                    if tr.release_year == "N/A":
+                        service_fails += 1
 
+                combined_ext_reason = f"Deezer: {dz_reason} | MusicBrainz: {mb_reason} | Apple: {apple_reason}"
                 if tr.isrc or tr.release_year != "N/A":
                     partial_ok += 1
                     missing_what = "ISRC" if not tr.isrc else "год выпуска"
+                    q_ttl_h = register_meta_quarantine_failure(
+                        meta_quarantine, sp_id, service_fails, missing_what, combined_ext_reason
+                    )
+                    q_note = f" [в мета-карантин на {format_duration(q_ttl_h * 3600)}]" if q_ttl_h > 0 else ""
                     logger.warning(
                         f"[ENRICH WARN] Не найден {missing_what} для '{tr.display_name}' "
-                        f"(ISRC: {tr.isrc or 'N/A'}, Год: {tr.release_year}) | "
+                        f"(ISRC: {tr.isrc or 'N/A'}, Год: {tr.release_year}){q_note} | "
                         f"Spotify: {sp_reason} | Deezer: {dz_reason} | MusicBrainz: {mb_reason}"
                     )
                 else:
                     failed_all += 1
+                    q_ttl_h = register_meta_quarantine_failure(
+                        meta_quarantine, sp_id, service_fails, "ISRC+Год", combined_ext_reason
+                    )
+                    q_note = f" [в мета-карантин на {format_duration(q_ttl_h * 3600)}]" if q_ttl_h > 0 else ""
                     logger.warning(
-                        f"[ENRICH FAIL] Не удалось получить ни ISRC, ни год для '{tr.display_name}' | "
-                        f"Spotify: {sp_reason} | Deezer: {dz_reason} | MusicBrainz: {mb_reason} | Apple: {apple_reason}"
+                        f"[ENRICH FAIL] Не удалось получить ни ISRC, ни год для '{tr.display_name}'{q_note} | "
+                        f"Spotify: {sp_reason} | {combined_ext_reason}"
                     )
             except Exception as e:
                 failed_all += 1
@@ -2447,7 +2579,7 @@ async def enrich_tracks_metadata(
                     logger.info(
                         f"[ENRICH PROGRESS] Обработано: {processed_count}/{total_to_enrich} ({pct}%) | "
                         f"Полные (ISRC+Год) — Spotify: {ok_spotify}, Deezer: {ok_deezer}, MB/Apple: {ok_mb_apple} | "
-                        f"Только Год (Spotify Embed): {partial_ok} | Отказов: {failed_all}"
+                        f"Только Год: {partial_ok} | Пропуск (мета-карантин): {skipped_meta_q} | Отказов: {failed_all}"
                     )
 
         await asyncio.gather(*(enrich_single_track_chain(idx) for idx in to_fetch_indices))
@@ -2460,6 +2592,7 @@ async def fetch_spotify_tracks_with_cache(
     playlist_source: str,
     cache_data: dict[str, Any],
     ignored_keys: set[str] | None = None,
+    ignore_quarantine: bool = False,
 ) -> tuple[list[TrackMeta], str, bool, int, int, float, float]:
     token_ctx = current_ctx.set("SPOTIFY")
     try:
@@ -2483,16 +2616,11 @@ async def fetch_spotify_tracks_with_cache(
             cached_tracks_dict = cache_data.get("tracks", {})
             is_full_cached = cache_data.get("is_full_playlist", False)
 
-            has_isrc_in_cache = sum(1 for e in cached_tracks_dict.values() if (e.get("meta") or {}).get("isrc")) > (
-                len(cached_tracks_dict) // 2
-            )
-
             if (
                 remote_snapshot
                 and remote_snapshot == cached_snapshot
                 and playlist_source == cached_url
                 and is_full_cached
-                and has_isrc_in_cache
                 and len(cached_tracks_dict) > 0
             ):
                 parse_dt = max(time.monotonic() - t_parse_start, 0.01)
@@ -2510,8 +2638,24 @@ async def fetch_spotify_tracks_with_cache(
                 ign_cached_cnt = len(all_valid_cached) - len(tracks_from_cache)
                 if ign_cached_cnt > 0:
                     logger.info(f"[SPOTITRACKS IGNORES] Исключено из кэша по списку ignores: {ign_cached_cnt} треков.")
+
+                enrich_dt = 0.0
+                enrich_filtered = 0
+                incomplete_cnt = sum(
+                    1 for t in tracks_from_cache if not t.has_full_meta and not t.spotify_id.startswith("custom_")
+                )
+                if incomplete_cnt > 0:
+                    t_enrich_start = time.monotonic()
+                    tracks_from_cache, enrich_filtered = await enrich_tracks_metadata(
+                        client, tracks_from_cache, web_token, cache_data, ignore_quarantine=ignore_quarantine
+                    )
+                    enrich_dt = max(time.monotonic() - t_enrich_start, 0.01)
+
                 raw_tot = int(cache_data.get("raw_playlist_total") or len(all_valid_cached))
-                filt_cnt = max(int(cache_data.get("filtered_unavailable_count") or 0) + ign_cached_cnt, max(0, raw_tot - len(tracks_from_cache)))
+                filt_cnt = max(
+                    int(cache_data.get("filtered_unavailable_count") or 0) + ign_cached_cnt + enrich_filtered,
+                    max(0, raw_tot - len(tracks_from_cache)),
+                )
                 full_meta_cnt = sum(1 for t in tracks_from_cache if t.has_full_meta)
                 logger.info(
                     f"[CACHE HIT] Плейлист не изменился (snapshot_id: {remote_snapshot[:12]}..., "
@@ -2519,7 +2663,7 @@ async def fetch_spotify_tracks_with_cache(
                     f"Всего в плейлисте: {raw_tot} | Отфильтровано: {filt_cnt} | "
                     f"Финально доступно: {len(tracks_from_cache)} (полные ISRC+Год: {full_meta_cnt}/{len(tracks_from_cache)})"
                 )
-                return tracks_from_cache, remote_snapshot, True, raw_tot, filt_cnt, parse_dt, 0.0
+                return tracks_from_cache, remote_snapshot, True, raw_tot, filt_cnt, parse_dt, enrich_dt
 
             tracks: list[TrackMeta] = []
             raw_total = total_filtered = 0
@@ -2544,7 +2688,9 @@ async def fetch_spotify_tracks_with_cache(
                         f"Всего: {gql_raw_total} | Доступно: {len(gql_tracks)} | Отфильтровано на старте: {gql_filtered}"
                     )
                     t_enrich_start = time.monotonic()
-                    tracks, enrich_filtered = await enrich_tracks_metadata(client, gql_tracks, web_token, cache_data)
+                    tracks, enrich_filtered = await enrich_tracks_metadata(
+                        client, gql_tracks, web_token, cache_data, ignore_quarantine=ignore_quarantine
+                    )
                     enrich_dt = max(time.monotonic() - t_enrich_start, 0.01)
                     raw_total = gql_raw_total or (len(tracks) + gql_filtered + enrich_filtered)
                     total_filtered = gql_filtered + enrich_filtered
@@ -2561,7 +2707,9 @@ async def fetch_spotify_tracks_with_cache(
                     f"{format_duration(parse_dt)} (всего в виджете: {emb_raw_total})..."
                 )
                 t_enrich_start = time.monotonic()
-                tracks, enrich_filtered = await enrich_tracks_metadata(client, embed_tracks, web_token, cache_data)
+                tracks, enrich_filtered = await enrich_tracks_metadata(
+                    client, embed_tracks, web_token, cache_data, ignore_quarantine=ignore_quarantine
+                )
                 enrich_dt = max(time.monotonic() - t_enrich_start, 0.01)
                 raw_total = emb_raw_total
                 total_filtered = emb_filtered + enrich_filtered
@@ -2577,12 +2725,14 @@ async def fetch_spotify_tracks_with_cache(
             only_isrc_count = sum(1 for t in tracks if t.isrc and t.release_year == "N/A")
             only_year_count = sum(1 for t in tracks if not t.isrc and t.release_year != "N/A")
             missing_both_count = len(tracks) - full_meta_count - only_isrc_count - only_year_count
+            meta_q_count = len(load_meta_quarantine())
 
             logger.info(
                 f"Обогащение метаданных завершено за {format_duration(enrich_dt)} "
                 f"({len(tracks)/enrich_dt:.1f} треков/сек): "
                 f"Всего доступно: {len(tracks)} | Успешно (ISRC+Год): {full_meta_count} | "
-                f"Только ISRC: {only_isrc_count} | Только Год: {only_year_count} | Не получено: {missing_both_count}"
+                f"Только ISRC: {only_isrc_count} | Только Год: {only_year_count} | "
+                f"Не получено: {missing_both_count} | В мета-карантине: {meta_q_count}"
             )
 
             if (LOG_SHOW_PARSED_TRACKS or logger.isEnabledFor(logging.DEBUG)) and tracks:
@@ -4029,7 +4179,9 @@ def print_cli_help() -> None:
         f"     --stall-timeout <SEC>    WORKER_STALL_TIMEOUT_SEC        [{format_duration(WORKER_STALL_TIMEOUT_SEC)} без данных]\n"
         f"     --max-hard-timeout <SEC> WORKER_MAX_HARD_TIMEOUT_SEC     [{format_duration(WORKER_STAGE_MAX_TIMEOUT_SEC)}]\n"
         f"     --min-speed-kbps <KBPS>  MIN_ACCEPTABLE_SPEED_KBPS       [{MIN_ACCEPTABLE_SPEED_KBPS:g} KB/s]\n"
-        f"     --fail-ttl <HOURS>       FAIL_TTL_HOURS                  [{format_duration(FAIL_TTL_HOURS * 3600)} макс. карантин]\n\n"
+        f"     --fail-ttl <HOURS>       FAIL_TTL_HOURS                  [{format_duration(FAIL_TTL_HOURS * 3600)} макс. карантин]\n"
+        f"     --meta-fail-ttl <HOURS>  META_FAIL_TTL_HOURS             [{format_duration((max(24.0, META_FAIL_TTL_HOURS) if META_FAIL_TTL_HOURS > 0 else 0.0) * 3600)} мин. мета-карантин]\n"
+        f"     --failed-meta-file <P>   FAILED_META_CACHE_FILE          [{FAILED_META_CACHE_FILE}]\n\n"
         f"   • Интеграция с AzuraCast API (Активна: {yn(is_azuracast_configured())}):\n"
         f"     --azuracast-url <URL>           AZURACAST_URL            [{AZURACAST_URL or 'Нет'}]\n"
         f"     --azuracast-api-key <KEY>       AZURACAST_API_KEY        [{az_key_status}]\n"
@@ -4038,9 +4190,10 @@ def print_cli_help() -> None:
         f"     --azuracast-playlist-id <ID>    AZURACAST_PLAYLIST_ID    [{AZURACAST_PLAYLIST_ID or 'Нет'}]\n"
         f"     --azuracast-playlist-name <STR> AZURACAST_PLAYLIST_NAME  [{AZURACAST_PLAYLIST_NAME or 'Нет'}]\n"
         f"     --azuracast-media-subdir <DIR>  AZURACAST_MEDIA_SUBDIR   [{AZURACAST_MEDIA_SUBDIR or 'Корень /'}]\n\n"
-        f"   • Логирование:\n"
+        f"   • Логирование и Формат времени:\n"
         f"     --log-level <LEVEL>      LOG_LEVEL (TRACE|DEBUG|INFO|WARN|ERROR) [{LOG_LEVEL_STR}]\n"
-        f"     --log-file <PATH>        LOG_FILE                        [{LOG_FILE or 'Отключен'}]\n\n"
+        f"     --log-file <PATH>        LOG_FILE                        [{LOG_FILE or 'Отключен'}]\n"
+        f"     --time-format <FMT>      TIME_FORMAT                     [{TIME_FORMAT}]\n\n"
         f" [6] БУЛЕВЫ ПЕРЕКЛЮЧАТЕЛИ (--флаг включает true | --no-флаг выключает false)\n"
         f"{sep_sub}\n"
         f"   --[no-]filter-unavailable  FILTER_UNAVAILABLE_SPOTIFY      [{yn(FILTER_UNAVAILABLE_SPOTIFY)}]\n"
@@ -4096,37 +4249,63 @@ def print_cli_help() -> None:
 def print_quarantine_report(
     quarantine: dict[str, dict[str, Any]] | None = None,
     cache_data: dict[str, Any] | None = None,
+    meta_quarantine: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     if quarantine is None:
         quarantine = load_quarantine()
+    if meta_quarantine is None:
+        meta_quarantine = load_meta_quarantine()
     if cache_data is None:
         cache_data = load_folder_cache()
 
     tracks_cache = cache_data.get("tracks") or {}
+    now = time.time()
+
     print("\n" + "=" * 88)
-    print(f" СПИСОК ТРЕКОВ В КАРАНТИНЕ ({len(quarantine)} шт.) | Файл: {FAILED_CACHE_FILE}")
+    print(f" 1. КАРАНТИН СКАЧИВАНИЯ ТРЕКОВ ({len(quarantine)} шт.) | Файл: {FAILED_CACHE_FILE}")
     print("=" * 88)
     if not quarantine:
-        print(" Карантин пуст! Все треки доступны для обработки.\n" + "=" * 88 + "\n")
-        return
+        print(" Карантин скачивания пуст! Все треки доступны для обработки.")
+    else:
+        width = len(str(len(quarantine)))
+        for idx, (sp_id, q_info) in enumerate(quarantine.items(), 1):
+            meta_dict = (tracks_cache.get(sp_id) or {}).get("meta") or {}
+            artist = meta_dict.get("artist") or "Unknown"
+            title = meta_dict.get("title") or sp_id
+            disp = f"{artist} - {title}" if title != sp_id else sp_id
+            q_time = float(q_info.get("time", now))
+            q_ttl = float(q_info.get("ttl_hours", FAIL_TTL_HOURS))
+            left_sec = max(0.0, q_ttl * 3600 - (now - q_time))
+            on_disk = (OUTPUT_DIR / f"{sp_id}.mp3").exists()
+            print(
+                f" [{idx:0{width}d}/{len(quarantine)}] {disp} ({sp_id}.mp3)\n"
+                f"       • На диске: {yn(on_disk)} | Попыток: {int(q_info.get('attempts', 1))} | "
+                f"Осталось: {format_duration(left_sec)} из {format_duration(q_ttl * 3600)}\n"
+                f"       • Причина: {q_info.get('reason', 'Неизвестная ошибка')}"
+            )
 
-    now = time.time()
-    width = len(str(len(quarantine)))
-    for idx, (sp_id, q_info) in enumerate(quarantine.items(), 1):
-        meta_dict = (tracks_cache.get(sp_id) or {}).get("meta") or {}
-        artist = meta_dict.get("artist") or "Unknown"
-        title = meta_dict.get("title") or sp_id
-        disp = f"{artist} - {title}" if title != sp_id else sp_id
-        q_time = float(q_info.get("time", now))
-        q_ttl = float(q_info.get("ttl_hours", FAIL_TTL_HOURS))
-        left_sec = max(0.0, q_ttl * 3600 - (now - q_time))
-        on_disk = (OUTPUT_DIR / f"{sp_id}.mp3").exists()
-        print(
-            f" [{idx:0{width}d}/{len(quarantine)}] {disp} ({sp_id}.mp3)\n"
-            f"       • На диске: {yn(on_disk)} | Попыток: {int(q_info.get('attempts', 1))} | "
-            f"Осталось: {format_duration(left_sec)} из {format_duration(q_ttl * 3600)}\n"
-            f"       • Причина: {q_info.get('reason', 'Неизвестная ошибка')}"
-        )
+    print("\n" + "=" * 88)
+    print(f" 2. КАРАНТИН ОБОГАЩЕНИЯ МЕТАДАННЫХ ({len(meta_quarantine)} шт.) | Файл: {FAILED_META_CACHE_FILE}")
+    print("=" * 88)
+    if not meta_quarantine:
+        print(" Карантин метаданных пуст!")
+    else:
+        width_m = len(str(len(meta_quarantine)))
+        for idx, (sp_id, mq_info) in enumerate(meta_quarantine.items(), 1):
+            meta_dict = (tracks_cache.get(sp_id) or {}).get("meta") or {}
+            artist = meta_dict.get("artist") or "Unknown"
+            title = meta_dict.get("title") or sp_id
+            disp = f"{artist} - {title}" if title != sp_id else sp_id
+            mq_time = float(mq_info.get("time", now))
+            mq_ttl = float(mq_info.get("ttl_hours", max(24.0, META_FAIL_TTL_HOURS)))
+            left_sec = max(0.0, mq_ttl * 3600 - (now - mq_time))
+            print(
+                f" [{idx:0{width_m}d}/{len(meta_quarantine)}] {disp} ({sp_id})\n"
+                f"       • Не найдено: {mq_info.get('missing', 'ISRC/Год')} | Циклов: {int(mq_info.get('attempts', 1))} | "
+                f"Фейлов сервисов: {int(mq_info.get('service_fails', 1))} | "
+                f"Осталось: {format_duration(left_sec)} из {format_duration(mq_ttl * 3600)}\n"
+                f"       • Причина: {mq_info.get('reason', 'Неизвестно')}"
+            )
     print("=" * 88 + "\n")
 
 
@@ -4217,6 +4396,7 @@ def print_status_report() -> None:
     overrides_map, custom_tracks, _, ignores_cnt = load_custom_spotitracks()
     unique_overrides_cnt = len({id(v) for v in overrides_map.values()})
     quarantine = load_quarantine()
+    meta_quarantine = load_meta_quarantine()
     total_bytes, mp3_count, free_bytes = measure_directory_stats(OUTPUT_DIR)
     tracks_cache = cache_data.get("tracks") or {}
     full_meta_cnt = sum(1 for e in tracks_cache.values() if (e.get("meta") or {}).get("isrc") and (e.get("meta") or {}).get("release_date"))
@@ -4231,7 +4411,7 @@ def print_status_report() -> None:
     print(f" • Скачано на диск ({OUTPUT_DIR}): {len(local_managed)} шт. (Всего MP3 в папке: {mp3_count} шт.)")
     print(
         f" • Ожидают докачки / Карантин: Докачка: {pending_cnt} шт. | "
-        f"В карантине: {len(quarantine)} шт. (TTL: {format_duration(FAIL_TTL_HOURS * 3600)})"
+        f"Карантин треков: {len(quarantine)} шт. | Карантин метаданных: {len(meta_quarantine)} шт."
     )
     print(
         f" • Кастомных (.spotitracks)  : Треков: {len(custom_tracks)} шт. | "
@@ -4242,8 +4422,8 @@ def print_status_report() -> None:
     print(f" • Авторизация YouTube (18+) : {yn(ok_cookie)} ({cookie_msg})")
     print(f" • Фоллбэки поиска           : DirectURL->Каскад: {yn(DIRECT_URL_FALLBACK)} | Фоллбэк YT #4: {yn(ENABLE_FALLBACK_SEARCH)}")
     print("=" * 88)
-    if quarantine:
-        print_quarantine_report(quarantine=quarantine, cache_data=cache_data)
+    if quarantine or meta_quarantine:
+        print_quarantine_report(quarantine=quarantine, cache_data=cache_data, meta_quarantine=meta_quarantine)
     else:
         print()
 
@@ -4521,7 +4701,9 @@ async def run_sync_cycle(
         (
             tracks, new_snapshot, from_cache_hit, raw_playlist_total,
             filtered_unavailable_count, parse_dt, enrich_dt,
-        ) = await fetch_spotify_tracks_with_cache(target_playlist, cache_data, ignored_keys=ignored_keys)
+        ) = await fetch_spotify_tracks_with_cache(
+            target_playlist, cache_data, ignored_keys=ignored_keys, ignore_quarantine=ignore_quarantine
+        )
 
         for t in tracks:
             if t.cover_url:
@@ -4668,10 +4850,14 @@ async def run_sync_cycle(
     save_folder_cache(cache_data)
 
     quarantine = load_quarantine()
-    if ignored_keys and quarantine:
+    meta_quarantine = load_meta_quarantine()
+    if ignored_keys:
         for q_id in list(quarantine.keys()):
             if q_id in ignored_keys:
                 clear_quarantine_entry(quarantine, q_id)
+        for mq_id in list(meta_quarantine.keys()):
+            if mq_id in ignored_keys:
+                clear_meta_quarantine_entry(meta_quarantine, mq_id)
 
     to_download: list[TrackMeta] = []
     skipped_count = quarantined_count = 0
@@ -4809,9 +4995,9 @@ def apply_env_key_value_override(key: str, val: str) -> None:
     global SYNC_INTERVAL_MINUTES, OUTPUT_DIR, CACHE_FILENAME, CUSTOM_TRACKS_FILENAME, STAGING_DIR
     global SYNC_DELETE_REMOVED, SYNC_DELETE_IGNORED, PUID, PGID, CONCURRENT_DOWNLOADS, YTDLP_RETRIES, YTDLP_SOCKET_TIMEOUT_SEC
     global WORKER_BASE_TIMEOUT_SEC, WORKER_SEARCH_TIMEOUT_SEC, WORKER_STALL_TIMEOUT_SEC
-    global WORKER_STAGE_MAX_TIMEOUT_SEC, MIN_ACCEPTABLE_SPEED_KBPS, FAIL_TTL_HOURS
-    global FAILED_CACHE_FILE, YT_COOKIE_FILE, POT_PROVIDER_URL, AUDIO_NORMALIZE, AUDIO_TRIM_SILENCE
-    global ENABLE_FALLBACK_SEARCH, DIRECT_URL_FALLBACK
+    global WORKER_STAGE_MAX_TIMEOUT_SEC, MIN_ACCEPTABLE_SPEED_KBPS, FAIL_TTL_HOURS, META_FAIL_TTL_HOURS
+    global FAILED_CACHE_FILE, FAILED_META_CACHE_FILE, YT_COOKIE_FILE, POT_PROVIDER_URL, AUDIO_NORMALIZE, AUDIO_TRIM_SILENCE
+    global ENABLE_FALLBACK_SEARCH, DIRECT_URL_FALLBACK, TIME_FORMAT
     global AZURACAST_URL, AZURACAST_API_KEY, AZURACAST_STATION_ID, AZURACAST_PLAYLIST_ID
     global AZURACAST_PLAYLIST_NAME, AZURACAST_MEDIA_SUBDIR
     global LOG_LEVEL_STR, LOG_COLORS, LOG_FILE, LOG_SHOW_PARSED_TRACKS, LOG_SHOW_SCORING
@@ -4821,6 +5007,9 @@ def apply_env_key_value_override(key: str, val: str) -> None:
     v = val.strip()
     try:
         match k:
+            case "TIME_FORMAT":
+                if val:
+                    TIME_FORMAT = val
             case "PLAYLIST_URL" | "PLAYLIST":
                 PLAYLIST_URL = v
             case "SPOTIFY_MARKET" | "MARKET":
@@ -4869,6 +5058,10 @@ def apply_env_key_value_override(key: str, val: str) -> None:
                 FAIL_TTL_HOURS = max(0.0, float(v))
             case "FAILED_CACHE_FILE":
                 FAILED_CACHE_FILE = Path(v)
+            case "META_FAIL_TTL_HOURS" | "META_FAIL_TTL":
+                META_FAIL_TTL_HOURS = max(0.0, float(v))
+            case "FAILED_META_CACHE_FILE" | "FAILED_META_FILE":
+                FAILED_META_CACHE_FILE = Path(v)
             case "YT_COOKIE_FILE" | "COOKIE_FILE":
                 YT_COOKIE_FILE = Path(v)
             case "POT_PROVIDER_URL":
@@ -4947,6 +5140,11 @@ VALUE_CLI_FLAGS_MAP: dict[str, str] = {
     "--fail-ttl-hours": "FAIL_TTL_HOURS",
     "--fail-ttl": "FAIL_TTL_HOURS",
     "--failed-cache-file": "FAILED_CACHE_FILE",
+    "--meta-fail-ttl-hours": "META_FAIL_TTL_HOURS",
+    "--meta-fail-ttl": "META_FAIL_TTL_HOURS",
+    "--failed-meta-cache-file": "FAILED_META_CACHE_FILE",
+    "--failed-meta-file": "FAILED_META_CACHE_FILE",
+    "--time-format": "TIME_FORMAT",
     "--yt-cookie-file": "YT_COOKIE_FILE",
     "--cookie-file": "YT_COOKIE_FILE",
     "--pot-provider-url": "POT_PROVIDER_URL",
