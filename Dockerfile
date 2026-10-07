@@ -29,6 +29,7 @@ RUN python -m nuitka \
     --include-package=yt_dlp \
     --include-package=httpx \
     --include-package=mutagen \
+    --lto=yes \
     src/main.py
 
 # ==========================================
