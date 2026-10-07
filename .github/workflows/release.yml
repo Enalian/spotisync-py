@@ -69,8 +69,8 @@ jobs:
       - name: Build and push architecture-specific image
         uses: docker/build-push-action@v6
         with:
-          context: ./spotisync
-          file: ./spotisync/Dockerfile
+          context: ./
+          file: ./Dockerfile
           push: true
           platforms: ${{ matrix.platform }}
           tags: ${{ steps.meta.outputs.tags }}
