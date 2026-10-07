@@ -18,12 +18,7 @@ services:
       - netbird_data:/var/lib/netbird
 
   spotisync:
-    build:
-      context: ./spotisync
-      dockerfile: Dockerfile
-      args:
-        PUID: 1000
-        PGID: 1000
+    image: ghcr.io/enalian/spotisync-py:latest
     container_name: azuracast_spotisync
     user: "1000:1000"
     restart: unless-stopped
