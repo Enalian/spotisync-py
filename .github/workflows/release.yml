@@ -31,7 +31,7 @@ jobs:
             runner: ubuntu-latest
             platform: linux/amd64
           - arch: arm64
-            runner: ubuntu-24.04-arm # Нативный ARM-раннер без эмуляции QEMU
+            runner: ubuntu-24.04-arm # Нативный ARM-раннер
             platform: linux/arm64
 
     steps:
@@ -48,11 +48,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Кэшируем директорию кэша Nuitka, чтобы не компилировать неизменившиеся библиотеки заново
+      - name: Cache Nuitka files
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/nuitka
+          key: nuitka-${{ matrix.arch }}-${{ hashFiles('**/requirements.txt', 'src/**/*.py') }}
+          restore-keys: |
+            nuitka-${{ matrix.arch }}-
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}{{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}},value=${{ inputs.tag || github.event.release.tag_name }}
             type=raw,value=${{ matrix.arch }}
@@ -60,8 +69,8 @@ jobs:
       - name: Build and push architecture-specific image
         uses: docker/build-push-action@v6
         with:
-          context: ./
-          file: ./Dockerfile
+          context: ./spotisync
+          file: ./spotisync/Dockerfile
           push: true
           platforms: ${{ matrix.platform }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -86,28 +95,23 @@ jobs:
         run: |
           FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
 
-          # Убираем префикс 'v' для парсинга (если он есть)
           CLEAN_TAG="${TAG#v}"
           IFS='.' read -r MAJOR MINOR PATCH <<< "$CLEAN_TAG"
 
-          # Определяем, был ли префикс 'v' в оригинальном теге
           HAS_V=""
           [[ "$TAG" == v* ]] && HAS_V="v"
 
-          # Формируем список тегов для мультиархитектурного манифеста
           BUILDX_ARGS=("-t" "$FULL_IMAGE:latest" "-t" "$FULL_IMAGE:$TAG")
 
           if [[ -n "$MAJOR" && -n "$MINOR" && -n "$PATCH" ]]; then
             BUILDX_ARGS+=("-t" "$FULL_IMAGE:${HAS_V}${MAJOR}")
             BUILDX_ARGS+=("-t" "$FULL_IMAGE:${HAS_V}${MAJOR}.${MINOR}")
-            # Дубликаты без буквы 'v'
             BUILDX_ARGS+=("-t" "$FULL_IMAGE:${MAJOR}")
             BUILDX_ARGS+=("-t" "$FULL_IMAGE:${MAJOR}.${MINOR}")
           fi
 
           echo "Создаем мультиархитектурные манифесты для тегов: ${BUILDX_ARGS[*]}"
 
-          # Объединяем amd64 и arm64 под всеми тегами
           docker buildx imagetools create \
             "${BUILDX_ARGS[@]}" \
             "$FULL_IMAGE:amd64" \
