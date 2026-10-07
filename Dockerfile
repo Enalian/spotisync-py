@@ -19,10 +19,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt "nuitka[onefile]" zstandard
 
 COPY src/ ./src/
-
-# Компилируем!
-# --onefile делает единый бинарник
-# --enable-plugin=pydantic критически важен для работы Pydantic
 RUN python -m nuitka \
     --onefile \
     --jobs=4 \
@@ -30,6 +26,7 @@ RUN python -m nuitka \
     --include-package=pydantic \
     --include-package=pydantic_core \
     --include-package=pydantic_settings \
+    --include-package=yt_dlp \
     --include-package=httpx \
     --include-package=mutagen \
     src/main.py
