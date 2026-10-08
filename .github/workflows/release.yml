@@ -118,8 +118,6 @@ jobs:
           if [[ -n "$MAJOR" && -n "$MINOR" && -n "$PATCH" ]]; then
             BUILDX_ARGS+=("-t" "$FULL_IMAGE:${HAS_V}${MAJOR}")
             BUILDX_ARGS+=("-t" "$FULL_IMAGE:${HAS_V}${MAJOR}.${MINOR}")
-            BUILDX_ARGS+=("-t" "$FULL_IMAGE:${MAJOR}")
-            BUILDX_ARGS+=("-t" "$FULL_IMAGE:${MAJOR}.${MINOR}")
           fi
 
           docker buildx imagetools create \
