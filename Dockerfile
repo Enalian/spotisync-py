@@ -35,7 +35,7 @@ RUN python -m nuitka \
 # ==========================================
 # STAGE 2: Финальный образ (только бинарник и FFmpeg)
 # ==========================================
-FROM debian:bookworm-slim AS runner
+FROM debian:stable-slim AS runner
 
 ARG PUID=1000
 ARG PGID=1000
