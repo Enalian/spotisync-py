@@ -84,8 +84,15 @@ class SpotifyClient:
         return discovered
 
     async def fetch_embed_session_and_preview(
-        self, playlist_id: str
+        self, playlist_input: str
     ) -> tuple[list[TrackMeta], str | None, str | None, int, int]:
+        playlist_id = (
+            playlist_input.split("playlist/")[-1].split("?")[0]
+            if "playlist/" in playlist_input
+            else playlist_input
+        )
+        playlist_id = playlist_id.split(":")[-1] if ":" in playlist_id else playlist_id
+
         embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         logger.info(f"Получаем гостевую сессию Веб-плеера через: {embed_url}")
         resp = await self.client.get(embed_url, headers={"User-Agent": BROWSER_UA})
