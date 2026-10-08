@@ -22,6 +22,8 @@ from src.core.logger import (
 )
 from src.core.models import TrackMeta
 
+APP_VERSION = "v7.3.19"
+
 
 def tag_mp3_file(file_path: Path, meta: TrackMeta) -> None:
     try:
@@ -159,6 +161,7 @@ async def async_main():
 
     setup_logger(clear_logs=clear_logs)
 
+    logger.info(f"🚀 Запуск SpotiSync {APP_VERSION}")
     if exit_immediately:
         logger.info("Флаг --exit обнаружен. Завершение работы.")
         return
