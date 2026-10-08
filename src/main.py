@@ -22,7 +22,7 @@ from src.core.logger import (
 )
 from src.core.models import TrackMeta
 
-APP_VERSION = "v7.3.19"
+APP_VERSION = "v7.3.19-MODERN"
 
 
 def tag_mp3_file(file_path: Path, meta: TrackMeta) -> None:
