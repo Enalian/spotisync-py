@@ -144,6 +144,7 @@ jobs:
             --onefile \
             --jobs=4 \
             --assume-yes-for-downloads \
+            --lto=yes \
             --output-filename=${{ matrix.bin-name }} \
             --include-package=pydantic \
             --include-package=pydantic_core \
