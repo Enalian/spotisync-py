@@ -11,7 +11,30 @@ current_ctx: contextvars.ContextVar[str] = contextvars.ContextVar(
     "current_ctx", default="MAIN"
 )
 
-# Дополнительные уровни логирования
+# ==========================================
+# Управление состоянием остановки (Graceful Shutdown)
+# ==========================================
+_shutting_down = False
+
+
+def is_shutting_down() -> bool:
+    """Возвращает True, если скрипт находится в процессе остановки."""
+    return _shutting_down
+
+
+def trigger_graceful_shutdown(signame: str = "UNKNOWN") -> None:
+    """Активирует флаг остановки скрипта."""
+    global _shutting_down
+    if not _shutting_down:
+        _shutting_down = True
+        logger.warning(
+            f"[{signame}] Получен сигнал остановки. Ждем завершения текущих загрузок..."
+        )
+
+
+# ==========================================
+# Настройка кастомного логгера
+# ==========================================
 TRACE_LEVEL = 5
 SUCCESS_LEVEL = 25
 logging.addLevelName(TRACE_LEVEL, "TRACE")
