@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Тег релиза (например, v7.3.19)"
+        description: "Release tag (for example, v7.3.19)"
         required: true
         default: "v7.3.19"
         type: string
@@ -143,6 +143,7 @@ jobs:
           python -m nuitka \
             --onefile \
             --jobs=4 \
+            --mingw64 \
             --assume-yes-for-downloads \
             --lto=yes \
             --output-filename=${{ matrix.bin-name }} \
