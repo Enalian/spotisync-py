@@ -30,6 +30,7 @@ RUN python -m nuitka \
     --include-package=httpx \
     --include-package=mutagen \
     --lto=yes \
+    --assume-yes-for-downloads \
     src/main.py
 
 # ==========================================

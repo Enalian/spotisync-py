@@ -1,4 +1,4 @@
-name: Build Release (Docker & Linux Binaries)
+name: Build Release (Docker & All Binaries)
 
 on:
   release:
@@ -83,21 +83,33 @@ jobs:
           cache-to: type=gha,scope=build-${{ matrix.arch }},mode=max
 
   # ==========================================
-  # 2. Сборка нативных Linux-бинарников для релиза
+  # 2. Сборка нативных бинарников для всех ОС
   # ==========================================
   build-binaries:
-    name: Compile Binary (${{ matrix.arch }})
+    name: Compile Binary (${{ matrix.os-name }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: amd64
-            runner: ubuntu-latest
+          # Старая Ubuntu 22.04 для максимальной совместимости GLIBC
+          - runner: ubuntu-24.04
+            os-name: linux-amd64
             bin-name: spotisync-linux-amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+          - runner: ubuntu-24.04-arm
+            os-name: linux-arm64
             bin-name: spotisync-linux-arm64
+          # Windows
+          - runner: windows-latest
+            os-name: windows-amd64
+            bin-name: spotisync-windows-amd64.exe
+          # macOS (Intel и Apple Silicon)
+          - runner: macos-13
+            os-name: macos-intel
+            bin-name: spotisync-macos-intel
+          - runner: macos-14
+            os-name: macos-arm64
+            bin-name: spotisync-macos-arm64
 
     steps:
       - name: Checkout repository
@@ -112,10 +124,13 @@ jobs:
       - name: Cache Nuitka (Binary stage)
         uses: actions/cache@v4
         with:
-          path: ~/.cache/nuitka
-          key: nuitka-bin-${{ matrix.arch }}-${{ hashFiles('**/requirements.txt', 'src/**/*.py') }}
+          path: |
+            ~/.cache/nuitka
+            ~/AppData/Local/Nuitka/Nuitka/Cache
+            ~/Library/Caches/Nuitka
+          key: nuitka-bin-${{ matrix.os-name }}-${{ hashFiles('**/requirements.txt', 'src/**/*.py') }}
           restore-keys: |
-            nuitka-bin-${{ matrix.arch }}-
+            nuitka-bin-${{ matrix.os-name }}-
 
       - name: Install dependencies & Nuitka
         working-directory: ./
@@ -123,10 +138,12 @@ jobs:
 
       - name: Compile with Nuitka
         working-directory: ./
+        # --assume-yes-for-downloads критичен для Windows, чтобы скачивание компилятора не требовало 'Y' в консоли
         run: |
           python -m nuitka \
             --onefile \
             --jobs=4 \
+            --assume-yes-for-downloads \
             --output-filename=${{ matrix.bin-name }} \
             --include-package=pydantic \
             --include-package=pydantic_core \
@@ -134,7 +151,6 @@ jobs:
             --include-package=yt_dlp \
             --include-package=httpx \
             --include-package=mutagen \
-            --lto=yes \
             src/main.py
 
       - name: Upload Binary to GitHub Release
@@ -142,6 +158,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
         working-directory: ./
+        shell: bash
+        # shell: bash нужен, чтобы этот шаг отработал одинаково и на Linux, и на Windows
         run: |
           gh release upload "$RELEASE_TAG" "${{ matrix.bin-name }}" --clobber
 
@@ -153,7 +171,6 @@ jobs:
     needs: build-docker
     runs-on: ubuntu-latest
     steps:
-      # Принудительно переводим имя репозитория в нижний регистр и здесь
       - name: Lowercase repository name
         run: |
           echo "IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
