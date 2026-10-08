@@ -138,7 +138,7 @@ jobs:
 
       - name: Compile with Nuitka
         working-directory: ./
-        # --assume-yes-for-downloads критичен для Windows, чтобы скачивание компилятора не требовало 'Y' в консоли
+        shell: bash
         run: |
           python -m nuitka \
             --onefile \
